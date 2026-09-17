@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS jobs;
+DROP TABLE IF EXISTS target_companies;
+DROP TABLE IF EXISTS companies;
+DROP FUNCTION IF EXISTS normalize_website(TEXT);
+DROP FUNCTION IF EXISTS set_updated_at();
