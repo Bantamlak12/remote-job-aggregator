@@ -1,0 +1,123 @@
+# =========================================
+# Go
+# =========================================
+
+# Binaries
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+
+# Coverage
+coverage.out
+coverage.html
+*.coverprofile
+
+
+# =========================================
+# Environment / Secrets
+# =========================================
+
+.env
+.env.*
+!.env.example
+
+# Local configuration containing secrets
+config.local.yaml
+config.local.yml
+config.local.json
+
+# Credentials / certificates
+*.pem
+*.key
+*.crt
+
+
+# =========================================
+# IDE / Editors
+# =========================================
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+
+# =========================================
+# Logs
+# =========================================
+
+*.log
+logs/
+
+
+# =========================================
+# Temporary files
+# =========================================
+
+tmp/
+temp/
+.cache/
+*.tmp
+
+
+# =========================================
+# Docker
+# =========================================
+
+# Local Docker volumes / database data
+docker-data/
+postgres-data/
+pgdata/
+
+
+# =========================================
+# Database
+# =========================================
+
+# Local PostgreSQL data
+*.sqlite
+*.sqlite3
+
+# Database dumps
+*.sql.gz
+*.dump
+*.backup
+
+
+# =========================================
+# OS
+# =========================================
+
+.DS_Store
+Thumbs.db
+
+
+# =========================================
+# Project-specific
+# =========================================
+
+# Local job ingestion/debug output
+data/
+output/
+
+# Local notification/debug artifacts
+notifications.local/
+
+# Generated files
+generated/
+
+# Rule
+CLAUDE.md
