@@ -1,8 +1,6 @@
 # Project Status
 
-_Last updated: 2026-09-20. Generated after the original development worktree was lost and this
-session was recovered — see [Section 10](#10-development-continuation-instructions) before
-making changes._
+_Last updated: 2026-09-21._
 
 ## 1. Project Overview
 
@@ -17,22 +15,22 @@ Target scale (architectural, not yet exercised): 10,000+ companies, 100,000+ job
 loading the full dataset into memory. Tech stack: Go (stdlib-first), PostgreSQL, Docker.
 Full requirements live in the repo's (gitignored, not committed) `CLAUDE.md`.
 
-Only **Phase 1 — foundation** is implemented. Nothing that touches an actual job posting
-exists yet: no discovery, no ATS integration, no ingestion, no filtering, no ranking, no
-scheduler, no notifications.
+**Phase 1 and Phase 2 are implemented** (Phase 2 is committed and pushed with an open PR,
+not yet merged to `main` — see Section 2). There is still no ATS integration, ingestion,
+filtering, ranking, scheduling, or notification code: nothing in the system yet reads or
+stores an actual job posting.
 
 ## 2. Completed Work
 
 ### Phase 1: Configuration, database pool, migrations, CLI, graceful shutdown
 
-Merged to `main` via PR #1 (commit `7abc04d`, merge commit `beb25bf`, authored/merged
-2026-09-17). Verified working against the current `main` checkout on 2026-09-20 (see
-Section 7 for the exact commands run).
+Merged to `main` via PR #1 (commit `7abc04d`, merge commit `beb25bf`, 2026-09-17).
 
 **Config — `internal/config/config.go`**
 - Loads and validates all operational config from environment variables (`config.Load()`).
 - Explicit types (`Environment`, `LogFormat`, `DatabaseConfig`, `LogConfig`,
-  `ShutdownConfig`), no global mutable state — constructed once in `main` and passed down.
+  `ShutdownConfig`, `HTTPConfig`, `DiscoveryConfig` — the last two added in Phase 2), no
+  global mutable state — constructed once in `main` and passed down.
 - Every validation failure is collected and returned together (`errors.Join`), not one at a
   time.
 - `DATABASE_URL` validation never echoes the raw or even partially-parsed value in an error
@@ -90,9 +88,8 @@ Section 7 for the exact commands run).
   tested this way).
 
 **CLI — `cmd/aggregator/main.go`**
-- Commands: `run` (connect, block until shutdown signal, close pool), `migrate-up`,
-  `migrate-down` (always requires `--yes`; add `--all` for a full rollback instead of one
-  step), `migrate-force <version>`.
+- Commands: `run`, `migrate-up`, `migrate-down` (always requires `--yes`; add `--all` for a
+  full rollback), `migrate-force <version>` — plus `discover` added in Phase 2.
 - Graceful shutdown: first SIGINT/SIGTERM cancels context; a second one forces immediate
   `os.Exit(1)` (`installSignalHandling`) — needed because golang-migrate's own lock
   acquisition ignores the context it's given and runs with `context.Background()`
@@ -107,75 +104,192 @@ Section 7 for the exact commands run).
   `app` services. `scripts/postgres-initdb/01-create-test-db.sql` auto-provisions a second
   `aggregator_test` database so integration tests never point at the dev database.
 - `Dockerfile`: multi-stage build, `-trimpath -ldflags="-s -w"`, `ca-certificates` installed
-  in the final image (needed for any future outbound HTTPS/TLS), non-root user.
-- Verified live end to end: `docker compose build app`, `docker compose up -d`,
-  `docker compose run --rm app migrate-up` all succeed; the containerized app connects to
-  the containerized database.
+  in the final image, non-root user. **Updated in Phase 2** — see below.
 
-**Review process that produced this state.** This phase went through five rounds of
-independent, adversarial critic review (see the conversation history for full transcripts),
-each verifying claims by actually running commands — and, for several fixes, deliberately
-reverting the fix to confirm the regression test actually fails without it (mutation
-testing). That process is why the credential-leak, missing-invariant, unsafe-migrate-down,
-and false-success-on-signal issues above don't exist in the merged code — they were found
-and closed before merge, not left as known issues.
+**Review process.** Five rounds of independent, adversarial critic review, each verifying
+claims by actually running commands, several with mutation testing (deliberately reverting a
+fix to confirm its regression test fails without it). Closed a credential leak, missing
+DB-level invariants, an unsafe `migrate-down` default, and a false-success-on-signal bug
+before merge.
+
+---
+
+### Phase 2: Company persistence, HTTP client, discovery
+
+**Status: complete, committed (`e47e17d`, "feat: add company discovery"), pushed to
+`Bantamlak21/phase2-company-discovery-e451cddd`, open as PR #3
+(https://github.com/Bantamlak12/remote-job-aggregator/pull/3) — not yet merged to `main`.**
+No schema change (no new migration): Phase 2 is application code over the tables Phase 1
+already created.
+
+**`internal/httpclient`** — the one pooled, retrying HTTP client every outbound-network
+package shares (discovery today; ATS ingestion in a later phase).
+- `Config`/`DefaultConfig()`/`New(cfg) *Client`/`(*Client).Do`. `New` builds its own
+  `*http.Transport` (never `http.DefaultTransport`) with explicit `MaxIdleConns`,
+  `MaxIdleConnsPerHost`, `IdleConnTimeout`; TLS verification untouched.
+- `Do` retries 429 and 5xx (never other 4xx) and network errors, up to `MaxRetries`, with
+  exponential backoff + jitter; honors a response's `Retry-After` header (seconds or
+  HTTP-date) over the computed backoff, uncapped — a deliberate choice (a caller without a
+  context deadline can stall on a server's arbitrarily long `Retry-After`; the responsibility
+  is placed on the caller supplying a bounded context, not the client silently ignoring what
+  the server asked for).
+- Enforces `MaxResponseBytes` on the final response body via a wrapper that reads through
+  `io.LimitReader(body, limit+1)`: an exactly-at-limit body reads cleanly to `io.EOF`, an
+  over-limit one returns `ErrResponseTooLarge` (sticky on subsequent reads) instead of
+  silently truncating.
+- Redirect cap via `CheckRedirect`. **Found and fixed during review:** the original
+  `len(via) >= cfg.MaxRedirects` check was off by one — since `via` includes the original
+  request, it only permitted `MaxRedirects - 1` actual redirects, so `MaxRedirects: 1`
+  behaved identically to `MaxRedirects: 0` (refused every redirect). Fixed to
+  `len(via) > cfg.MaxRedirects`; regression tests pin both the exactly-one-redirect case and
+  the zero-redirects case.
+- Tests: `internal/httpclient/httpclient_test.go` (29 tests) — retry policy across ~20 status
+  codes, `Retry-After` parsing, the exact-boundary size-limit behavior, context cancellation
+  during a queued backoff, redirect-cap boundaries. All mutation-verified during review
+  (deliberately-broken variants confirmed to fail their matching test).
+
+**`internal/company`** — domain types and the only code that writes to
+`companies`/`target_companies`.
+- `Store`/`TargetStore`, each with `Upsert` as a single atomic `INSERT ... ON CONFLICT`
+  (never check-then-insert) targeting the exact expression the real unique index is built
+  on — verified against live Postgres via `EXPLAIN` showing the real conflict arbiter index,
+  plus a negative control (a subtly-wrong conflict target raises a real Postgres error,
+  proving inference is strict).
+- `Store.Upsert`: fills a NULL `website`/`description` on conflict, never overwrites an
+  existing non-null value. `TargetStore.Upsert`: `is_active` always reactivated to `true`
+  (re-discovery wins over a previous deactivation — there's no operator UI to deactivate a
+  target on purpose yet); `board_url` takes the freshly-probed value over a stale one;
+  `discovery_metadata` replaces wholesale when explicitly supplied, otherwise left alone
+  (tri-state via a nil vs. non-nil map).
+- `ErrNotFound` translated from `pgx.ErrNoRows`, never leaked raw. All SQL parameterized.
+- Tests: `internal/company/company_test.go` + `target_test.go` (27 tests) against real
+  Postgres, including `TestStoreUpsert_ConcurrentCallersConvergeOnOneRow` (8 concurrent
+  callers, one row, one ID — the actual proof `ON CONFLICT` is doing the work a
+  check-then-insert couldn't).
+
+**`internal/discovery`** — turns a list of candidate ATS boards into persisted
+companies/targets.
+- `LoadSeedCandidates(path)`: reads a JSON array, validates every candidate before returning
+  any (one bad entry fails the whole load with every invalid candidate's error reported
+  together via `errors.Join`, not just the first).
+- `Discoverer.Run`: bounded worker pool (`DISCOVERY_WORKERS`, config-validated to 1–100).
+  Depends on `company`/`httpclient` through small consumer-defined interfaces
+  (`CompanyUpserter`, `TargetUpserter`), not their concrete types, so orchestration logic is
+  tested with fakes rather than a database.
+- `probe`: HEAD first, falling back to GET on any non-2xx or network error from HEAD — per
+  CLAUDE.md's explicit rule that some ATS-hosted boards don't handle HEAD reliably. The
+  mechanism is proven against a controlled fake server
+  (`TestRun_HeadFailsGetSucceeds_FallsBackToGet`); live spot-checks against ~44 real
+  Greenhouse/Lever/Ashby/other ATS boards during review never found one where HEAD and GET
+  actually disagreed in the 2xx/non-2xx sense the code acts on — so the fallback is
+  defensive per the stated requirement, not something observed to be load-bearing against
+  real traffic yet (this distinction matters: an earlier draft claimed it was "verified
+  live," which review found unsupported and corrected).
+- **Found and fixed during review:** `New` with `workers <= 0` spawned zero worker
+  goroutines, so `Run`'s feeder goroutine leaked forever (blocked on an unbuffered channel
+  send nothing would ever drain) on any non-empty candidate list — reproduced with a
+  goroutine stack dump. Unreachable from the CLI (config already validates workers ≥ 1
+  before `New` is called) but `New` is exported, so it now clamps `workers` to at least 1.
+- Tests: `internal/discovery/discovery_test.go` + `seed_test.go` (23 tests) — HEAD/GET
+  fallback, worker-bound enforcement (measured, not assumed), invalid-candidate rejection
+  before any HTTP call, context-cancellation handling, the workers-clamp regression.
+
+**CLI — `aggregator discover [seed-file]`**
+- Defaults to `configs/seed_companies.json`. Loads candidates, connects to the database,
+  runs discovery, logs a per-candidate outcome, and exits non-zero only if *every* candidate
+  failed — a mix of successes and failures is discovery's normal steady state and must not
+  fail a cron-style invocation.
+- An empty candidate list (`[]`) returns success without ever connecting to the database
+  (verified: run against a deliberately unreachable `DATABASE_URL`, confirmed no connection
+  error).
+- Tests: argument validation, missing/empty seed file behavior — plus a full live run
+  against a real migrated database and the real seed file (see below).
+
+**`configs/seed_companies.json`** — ships two real, live-verified examples: Spotify on Lever
+(`https://jobs.lever.co/spotify`, direct 200) and Airbnb on Greenhouse
+(`https://boards.greenhouse.io/airbnb`, a 2-hop redirect chain to a 200). Both were run
+against the real internet during development and again during both review rounds, not just
+asserted to work.
+
+**Docker — found and fixed during review.** The Dockerfile's final stage originally copied
+only the compiled binary, not `configs/` — so `discover`'s default seed file path didn't
+exist inside the container. Fixed: final stage now has `WORKDIR /app`, copies `configs/`
+alongside the binary, `chown`s both to the non-root user. Verified: built the image, ran
+`docker compose run --rm app discover` against the containerized database, confirmed both
+seed companies discovered from inside the container using the container's own outbound
+network.
+
+**Config additions** — `HTTP_TIMEOUT`, `HTTP_MAX_RESPONSE_SIZE`, `HTTP_USER_AGENT`,
+`DISCOVERY_WORKERS`, validated the same way every other `internal/config` field is (defaults,
+override tests, invalid-value rejection with specific messages, all failures reported
+together).
+
+**Cross-package test collision — found and fixed during review.** With two packages
+(`internal/database`, `internal/company`) now resetting the shared `aggregator_test`
+database's schema in their own tests, `go test ./...`'s default package-level parallelism
+runs their test binaries as separate concurrent processes with no interlock — they drop each
+other's tables mid-run. Reproduced 3/3 tries without `-p 1`, clean 3/3 with it. Fixed via new
+`make test-integration`/`test-integration-race` Makefile targets that always pass `-p 1`, and
+a README warning that a bare `go test ./...` with `TEST_DATABASE_URL` set does not and will
+intermittently fail. **This is a convention, not a mechanism** — see Section 8.
+
+**Review process.** Built in three pieces: `internal/httpclient` and `internal/company` were
+each built by an independent subagent in an isolated worktree (both delivered
+mutation-tested); `internal/discovery`, CLI wiring, the Docker fix, and config extension were
+built directly. The integrated whole then went through two rounds of independent adversarial
+review. Round 1 (REJECT): found the three "found and fixed during review" items described
+above under `httpclient` and `discovery`. Round 2 (ACCEPT): independently re-verified all
+three fixes — 44 live ATS URL probes for the HEAD/GET claim, a from-scratch 10-case redirect
+budget matrix proving both the bug and the fix, and a clamp-reverted goroutine-leak
+reproduction by stack name — plus three non-blocking cosmetic observations, which were also
+addressed (a test name that only checked a lower bound, a missing explicit
+`MaxRedirects=0` test, a misleading test failure message).
 
 ## 3. Work In Progress
 
-Nothing is mid-implementation in the codebase itself — Phase 1 is complete and merged, and
-`git status` in a fresh worktree off `main` is clean.
+Nothing is mid-implementation in the codebase itself. `git status` in this worktree is clean;
+Phase 2's PR (#3) is open and passing, awaiting review/merge — that merge is the one
+outstanding administrative step, not development work.
 
-**However**, the original shared checkout at `/home/bantamlak/my-repos/remote-job-aggregator`
-(as distinct from the worktree this document was written in) currently has two files with
-**uncommitted local modifications** that predate this recovery and were not made by this
-session:
+**The original shared checkout** at `/home/bantamlak/my-repos/remote-job-aggregator` (as
+distinct from the worktree this document was written in) still has, as of this writing, two
+files with uncommitted local modifications that predate this document and were not made by
+this session (last checked 2026-09-21, unchanged since first noted 2026-09-20):
 
-- `.gitignore` — one addition not present in the committed version: a `.claude/` ignore
-  entry (with a `# Agent` comment), inserted just before the existing `CLAUDE.md` ignore
-  rule.
-- `Dockerfile` — purely cosmetic: blank lines added between each instruction. No content
-  difference otherwise.
+- `.gitignore` — a `.claude/` ignore entry not present in the committed version.
+- `Dockerfile` — cosmetic blank-line reformatting only.
 
-These were **not modified, committed, or discarded** while writing this document (per
-explicit instruction). If the `.claude/` gitignore addition is wanted, it should be
-committed properly through a worktree, not left dangling in the shared checkout.
+Not touched by this session; if the `.claude/` addition is wanted, commit it properly through
+a worktree rather than leaving it dangling in the shared checkout.
 
-There is also a Postgres container (`remote-job-aggregator-db-1`, `docker compose up -d db`
-run from the shared checkout, not a worktree) that has been running for approximately 9
-hours as of this writing. Its `aggregator` database is at migration version 1, clean, with
-zero rows in `companies`/`target_companies`/`jobs` — consistent with a plain
-`migrate-up` and no ingestion (which doesn't exist yet). No orphaned or unexplained data.
+A Postgres container (`remote-job-aggregator-db-1`) has been running continuously since
+before this document was first written and was used, read-only with respect to its role as
+shared test infrastructure, throughout Phase 2's development and review. Its `aggregator_test`
+database is currently clean (0 rows in `companies`/`target_companies`/`jobs`) — every test run
+against it cleaned up after itself.
 
 ## 4. Remaining Implementation Roadmap
 
-Ordered by dependency, per the original project requirements.
-
-### Phase 2 — Company & discovery, HTTP infrastructure
-- **Objective:** persist companies and their ATS targets; build the reusable HTTP client
-  infrastructure every provider integration will sit on.
-- **Tasks:** `company` package (repository over the existing `companies` table);
-  `discovery` package (seed companies, candidate ATS slug discovery, endpoint validation,
-  persist discovered targets to `target_companies`); pooled `http.Client` with timeouts,
-  max response size, User-Agent, retry/backoff for 429/5xx.
-- **Expected files/modules:** `internal/company/`, `internal/discovery/`, an HTTP client
-  builder (likely `internal/httpclient/` or similar).
-- **Dependencies:** none beyond Phase 1 (schema and pool already exist).
-- **Verification:** unit tests for discovery logic against fake HTTP servers/fixtures;
-  repository tests against real Postgres (same pattern as `internal/database`).
+Ordered by dependency, per the original project requirements. Phase 2 is complete — see
+Section 2 — and removed from this list.
 
 ### Phase 3 — ATS integration & ingestion
 - **Objective:** fetch and normalize jobs from Greenhouse (first provider), run ingestion
   as a bounded worker pool.
 - **Tasks:** `ats` package with a `Provider`-scoped client interface and Greenhouse's
   first; provider-specific response models kept separate from the normalized `job.Post`
-  type; `ingestion` package (load active targets, bounded worker pool, decode/normalize,
-  route through filtering/ranking once those exist); `job` package for normalization and
-  lifecycle (new/changed/removed detection, content-hash comparison).
+  type; `ingestion` package (load active targets from `internal/company`, bounded worker
+  pool, decode/normalize, route through filtering/ranking once those exist); `job` package
+  for normalization and lifecycle (new/changed/removed detection, content-hash comparison).
 - **Expected files/modules:** `internal/ats/greenhouse/`, `internal/ingestion/`,
   `internal/job/`.
-- **Dependencies:** Phase 2 (targets to ingest from, HTTP client).
+- **Dependencies:** Phase 2 (done — targets to ingest from via `internal/company`, the
+  shared HTTP client via `internal/httpclient`).
 - **Verification:** fake ATS test servers/fixtures (success, 404, 429, 500, invalid JSON,
-  slow/large response, duplicate/changed jobs); `go test -race` for the worker pool.
+  slow/large response, duplicate/changed jobs); `go test -race` for the worker pool. Note
+  from Phase 2's review: verify any "handles X unreliably" claim about a *specific* real ATS
+  behavior against the real internet before asserting it, the same way discovery's HEAD/GET
+  fallback claim was checked and corrected.
 
 ### Phase 4 — Geographic eligibility & relevance filtering
 - **Objective:** deterministic classification of remote-eligibility and role relevance.
@@ -220,8 +334,8 @@ Ordered by dependency, per the original project requirements.
 ## 5. Current Database State
 
 **Migrations:** one — `000001_init_schema` (up + down), applied and clean
-(`schema_migrations`: version 1, dirty=false) in both the local `aggregator` dev database
-and verified working against `aggregator_test`.
+(`schema_migrations`: version 1, dirty=false). Phase 2 added no migration; it only added Go
+code (`internal/company`) over the tables Phase 1 already created.
 
 **Tables:**
 
@@ -232,7 +346,10 @@ and verified working against `aggregator_test`.
 | `jobs` | Normalized postings | PK `id`; identity = unique `(source, source_job_id)` — **not** company+title; composite FKs `(target_company_id, company_id) → target_companies(id, company_id)` and `(target_company_id, source) → target_companies(id, ats_provider)` (both `ON DELETE CASCADE`) so a job can't be attributed to a company that doesn't own its board, and `source` can't drift from the board's own provider; `CHECK` non-blank on `source`/`source_job_id`/`title`/`application_url`/`content_hash`; `CHECK` `canonical_url IS NULL OR` non-blank; `remote_type`/`employment_type`/`status` are `CHECK`-constrained enums; `CHECK last_seen_at >= first_seen_at`; `CHECK (status IN ('closed','removed')) = (closed_at IS NOT NULL)`; unique partial index on `canonical_url` where present |
 
 **Relationships:** `companies` 1—N `target_companies` 1—N `jobs`, with `jobs` also holding a
-direct (constrained, see above) `company_id`.
+direct (constrained, see above) `company_id`. `companies`/`target_companies` are now
+actively read and written by `internal/company`'s repositories (exercised live by `discover`
+against real data — 2 companies, 2 targets, as of the last live verification run, cleaned up
+afterward). `jobs` remains untouched by any code — nothing writes to it until Phase 3.
 
 **Indexes beyond the uniqueness ones above:** `target_companies(company_id)`,
 `target_companies(is_active)` (partial, active only), `jobs(company_id)`,
@@ -247,8 +364,8 @@ firing only when a column other than `updated_at` itself actually changed.
 - No indexes/tables for ranking, scheduling state, or notification dedup — belong to
   Phases 5–6.
 
-**Database-related pending work:** none outstanding within Phase 1's scope. The next schema
-change is the Phase 4 `job_eligibility` migration.
+**Database-related pending work:** none. The next schema change is the Phase 4
+`job_eligibility` migration.
 
 ## 6. Current Architecture
 
@@ -259,42 +376,55 @@ cmd/aggregator (composition root)
     │
     ├─ internal/config          (env → validated Config)
     ├─ internal/observability   (slog construction)
-    └─ internal/database        (pgxpool + migration runner)
-            │
-            └─ migrations/      (embedded SQL, go:embed)
+    ├─ internal/database        (pgxpool + migration runner)
+    │       │
+    │       └─ migrations/      (embedded SQL, go:embed)
+    ├─ internal/httpclient      (pooled, retrying HTTP client)
+    ├─ internal/company         (Store/TargetStore over companies/target_companies)
+    ├─ internal/discovery       (seed candidates → probe → persist, via company + httpclient)
+    └─ configs/                 (seed_companies.json)
 ```
 
 One deployable binary. `cmd/aggregator/main.go` is the only place that wires concrete
-implementations together — `config.Load()` → `observability.NewLogger()` →
-`database.New()` → dispatch to the requested command. Nothing outside `internal/database`
-touches `pgxpool` directly; nothing outside `internal/config` reads `os.Getenv`.
+implementations together. Nothing outside `internal/database` touches `pgxpool` directly;
+nothing outside `internal/config` reads `os.Getenv`. `internal/discovery` depends on
+`internal/company` and `internal/httpclient` through small interfaces it defines itself
+(`CompanyUpserter`, `TargetUpserter`) rather than their concrete types — the consumer-defines-
+the-interface Go convention, chosen so discovery's own orchestration logic (HEAD/GET
+fallback, concurrency bound, error propagation) is unit-testable with fakes instead of always
+needing a database.
 
-**Planned, not implemented:** `internal/company`, `internal/discovery`, `internal/ats`,
-`internal/ingestion`, `internal/job`, `internal/filtering`, `internal/ranking`,
-`internal/notification`, `internal/scheduler` — see Section 4. These packages do not exist
-on disk. Do not assume any of their functionality when reasoning about what the system
-currently does.
+**Planned, not implemented:** `internal/ats`, `internal/ingestion`, `internal/job`,
+`internal/filtering`, `internal/ranking`, `internal/notification`, `internal/scheduler` — see
+Section 4. These packages do not exist on disk. Do not assume any of their functionality when
+reasoning about what the system currently does.
 
-**Concurrency implemented today:** only `pgxpool`'s internal connection management
-(bounded by config) and the CLI's own signal-handling goroutines (`installSignalHandling`,
-`watchGracefulStop`, `closeWithTimeout`). No worker pools, no channels-based pipeline yet —
-those arrive with ingestion in Phase 3.
+**Concurrency implemented today:** `pgxpool`'s internal connection management (bounded by
+config); the CLI's signal-handling goroutines (`installSignalHandling`, `watchGracefulStop`,
+`closeWithTimeout`); `internal/discovery`'s bounded worker pool
+(`DISCOVERY_WORKERS`, independent of the database pool and the HTTP client's own connection
+pool). No ingestion pipeline yet — that arrives in Phase 3.
 
 ## 7. Testing and Verification Status
 
-**Run and passing as of this document (2026-09-20, fresh worktree off `main` at
-`beb25bf`):**
+**Run and passing as of this document (2026-09-21, this worktree at commit `e47e17d`):**
 
 ```bash
-gofmt -l .                    # clean
-go build ./...                # clean
-go vet ./...                  # clean
-go test ./...                 # all 4 packages ok, DB tests skip without TEST_DATABASE_URL
-go test -race -count=1 ./...  # all 4 packages ok, WITH a live Postgres (TEST_DATABASE_URL
-                               #   set to the aggregator_test database on the already-running
-                               #   remote-job-aggregator-db-1 container) — 20/20 tests in
-                               #   internal/database pass under the race detector
+gofmt -l .                             # clean
+go build ./...                         # clean
+go vet ./...                           # clean
+go test ./...                          # all 7 packages ok, DB tests skip without TEST_DATABASE_URL
+TEST_DATABASE_URL=postgres://aggregator:aggregator@localhost:5432/aggregator_test \
+  go test -race -p 1 -count=1 ./...    # all 7 packages ok — 20 tests in internal/database,
+                                        #   27 in internal/company, 29 in internal/httpclient,
+                                        #   23 in internal/discovery, all under the race detector
 ```
+
+**`-p 1` is required** whenever `TEST_DATABASE_URL` is set and more than one package's tests
+run together: `internal/database` and `internal/company` both reset the shared
+`aggregator_test` schema, and `go test`'s default package-level parallelism runs them as
+separate processes with no interlock — confirmed to collide 3/3 tries without `-p 1`, clean
+3/3 with it. `make test-integration` / `make test-integration-race` already pass it.
 
 **Recommended verification commands for a fresh session:**
 
@@ -306,18 +436,26 @@ go vet ./...
 go test ./...                          # unit tests, no DB required
 
 docker compose up -d db                # or reuse the already-running container if present
-export TEST_DATABASE_URL=postgres://aggregator:aggregator@localhost:5432/aggregator_test
-go test -count=1 ./...
-go test -race -count=1 ./...
+make test-integration
+make test-integration-race
 
 docker compose build app
-docker compose run --rm app migrate-up # confirms the Docker path end to end
+docker compose run --rm app migrate-up
+docker compose run --rm app discover   # confirms the full Docker + discovery path end to end;
+                                        #   note the compose-project-name port-collision caveat
+                                        #   in README.md's Docker section if running from a
+                                        #   worktree alongside another running Postgres
 ```
 
-**Missing tests:** none within Phase 1's own scope — every package has both unit and (where
-a real dependency exists) integration coverage, including deliberately adversarial cases
-(context cancellation mid-migration, dirty-state recovery, credential redaction through a
-real log handler, double-signal force-exit). Coverage will naturally need to grow with each
+**Live (non-unit-test) verification performed during Phase 2 development and both review
+rounds:** the actual CLI binary run against a real, migrated Postgres and the real
+`configs/seed_companies.json`, both from the host and from inside the built Docker container,
+confirming real rows persisted with correct `discovery_metadata`; ~44 real ATS board URLs
+probed directly with `curl` (Greenhouse, Lever, Ashby, and a few others) to check the HEAD/GET
+fallback claim; a from-scratch redirect-budget test matrix against `httptest` servers,
+independent of the checked-in test suite, to verify the `MaxRedirects` off-by-one fix.
+
+**Missing tests:** none within Phase 1 or Phase 2's own scope. Coverage will grow with each
 future phase (fake ATS servers for Phase 3, an eval suite for Phase 4's classifier, etc.) —
 none of that exists yet because none of that code exists yet.
 
@@ -325,44 +463,58 @@ none of that exists yet because none of that code exists yet.
 
 ## 8. Known Issues and Risks
 
-- **Uncommitted local changes in the shared checkout** (Section 3) — not part of any
-  branch, not backed up anywhere except the live filesystem. If that checkout is lost again,
-  the `.claude/` gitignore addition would be lost with it (low cost: it's a one-line,
-  easily-redone change).
+- **`httpclient`'s `Retry-After` handling is uncapped.** A response's `Retry-After` header is
+  honored verbatim, however long it says. This is deliberate (servers that ask a client to
+  wait get exactly that, not a client second-guessing them), but it means a caller that
+  doesn't pass a context with its own deadline can stall for however long a
+  misconfigured or hostile server's `Retry-After` says. Every current caller (`discover`)
+  goes through the CLI's own context, which is bounded by process lifetime and the
+  double-signal force-exit, not a per-request deadline — worth revisiting when Phase 3 adds
+  a caller that might want a tighter bound.
+- **The `-p 1` integration-test requirement is a convention, not a mechanism.** Nothing
+  stops a future session (or a CI config) from running a bare `go test ./...` with
+  `TEST_DATABASE_URL` set and silently corrupting the shared test database mid-run. A
+  Postgres advisory lock in the shared test helper, or giving each DB-touching package its
+  own schema/database, would make this impossible instead of merely documented. Not done
+  yet — flagged during Phase 2 review as worth a follow-up, not a blocker.
 - **`ats_provider` is an unconstrained `TEXT` column** (no DB-level `CHECK`/enum) by
-  deliberate design — new providers shouldn't need a migration — but this means the Go-side
-  `ats.Provider` type (which doesn't exist yet) is the only thing that will ever validate it.
-  Not a bug today since nothing writes to this column outside tests.
-- **No HTTP client infrastructure exists yet.** Every future phase depends on it (Phase 2).
-  Building it without reusing a battle-tested pattern (connection pooling, backoff, size
-  limits) is the most likely place for a future session to reinvent something poorly if it
-  skips the "search before building" step CLAUDE.md requires.
+  deliberate design — new providers shouldn't need a migration — so the Go-side
+  `ats.Provider` type (which doesn't exist yet, arrives in Phase 3) is the only thing that
+  will ever validate it. Not a bug today; `internal/company`'s repositories don't validate
+  it beyond non-blank either, by the same reasoning.
 - **Single migration file.** `migrate-down`'s `--all` vs. single-step distinction is
   currently untested in the "more than one migration" case, since there's only ever been
-  one. This will get real exercise the moment Phase 4 adds a second migration — worth
-  double-checking `MigrateDownStep` behavior then, even though it's already unit-tested
-  against the underlying golang-migrate mechanics.
-- **This session was recovered after the original worktree was lost.** The cause of that
-  loss was not investigated as part of this task (out of scope — see the task that produced
-  this document). If it recurs, the recovery pattern in Section 10 should still apply.
+  one. This will get real exercise the moment Phase 4 adds a second migration.
+- **Uncommitted changes in the shared checkout** (Section 3) — low-cost, not touched by this
+  session, unrelated to Phase 2's own correctness.
+- **`configs/seed_companies.json`'s two examples are companies' real, currently-live ATS
+  boards.** If either Spotify or Airbnb ever changes ATS providers or takes their board down,
+  the shipped example will start failing `discover` (gracefully — it logs and skips, doesn't
+  crash) even though nothing in this repo is wrong. Worth a periodic manual re-check, not
+  worth building automation around yet.
 
 ## 9. Exact Next Step
 
-**Start Phase 2: build `internal/company` (a thin repository over the existing `companies`
-table) and the pooled HTTP client infrastructure `discovery` will need.**
+**Start Phase 3: build the `internal/ats` package with a Greenhouse client, and
+`internal/job` for the normalized job type.**
 
-Why this and not `internal/discovery` itself first: `discovery`'s job is to populate
-`companies`/`target_companies`, so it needs a `company` repository to write through, and it
-needs a properly configured `http.Client` (timeouts, size limits, User-Agent, retry/backoff)
-before it can safely make its first outbound request to a candidate ATS endpoint. Building
-the HTTP client in isolation first, with its own tests against a fake server, means
-`discovery`'s own tests can focus on discovery logic rather than re-deriving HTTP
-correctness inline.
+Why this and not `internal/ingestion` first: ingestion's job is to orchestrate "for each
+active target, fetch its jobs, normalize them, persist them" — it needs both something that
+knows how to fetch+parse a specific ATS's response format (`internal/ats`) and a normalized
+`job.Post` type with the identity/lifecycle rules from CLAUDE.md §9 to persist into (backed by
+a new `internal/job` repository over the existing `jobs` table, following the exact same
+`Store`/`Upsert`-via-`ON-CONFLICT` pattern `internal/company` already established and proved
+out). Building the ATS client and the job type first, each independently testable against
+fixtures/fakes, means ingestion's own tests can focus on orchestration (worker pool, error
+isolation between targets, change detection) rather than re-deriving Greenhouse's response
+shape or job identity rules inline.
 
-Concretely: read CLAUDE.md §13 (HTTP Architecture) and §11 (ATS Integrations) again before
-starting, since they specify the exact behaviors required (connection pooling, context
-cancellation, max response size, 429/5xx retry with backoff) — building this without that
-checklist in hand is how a future session ends up re-doing it.
+Concretely: read CLAUDE.md §10 (ATS Integrations), §9 (Job Identity and Deduplication), and
+§20 (Job Lifecycle) again before starting. Build fake Greenhouse fixtures/test servers per
+§26 before writing the real client against them — don't start with live Greenhouse calls the
+way discovery's seed examples were verified; Phase 3's fetch volume is real job content, not
+a HEAD/GET probe, and needs the fake-server harness to be safe to iterate on without hammering
+a real employer's board.
 
 ## 10. Development Continuation Instructions
 
@@ -372,22 +524,25 @@ checklist in hand is how a future session ends up re-doing it.
 2. Read `CLAUDE.md` at the repo root (gitignored — present locally, not on GitHub; if it's
    missing, ask Bantamlak for a copy before proceeding, since it carries the authoritative
    project requirements and the mandatory branching/testing/review workflow).
-3. Run the verification commands in [Section 7](#7-testing-and-verification-status) to
+3. Check whether PR #3 (Phase 2) has been merged since this document was last updated —
+   if it has, this document's "not yet merged to main" caveats in Sections 1–2 are stale;
+   update them rather than trusting them.
+4. Run the verification commands in [Section 7](#7-testing-and-verification-status) to
    confirm the state this document describes still matches reality — this document is a
    snapshot, not a live source of truth. If something doesn't match, trust the repository
    and update this document, not the other way around.
-4. Follow CLAUDE.md's "Branching" section exactly: one worktree per session, never write in
-   the shared checkout (`/home/bantamlak/my-repos/remote-job-aggregator`). This document was
-   itself written from inside a freshly created worktree for exactly this reason, after the
-   prior one was lost.
+5. Follow CLAUDE.md's "Branching" section exactly: one worktree per session, never write in
+   the shared checkout (`/home/bantamlak/my-repos/remote-job-aggregator`).
 
 **After completing meaningful work:**
 
-1. Update this document's relevant sections — especially Section 2 (move newly-completed
-   work out of Section 4), Section 3, Section 5 if the schema changed, and Section 9 (name
-   the new next step).
+1. Update this document's relevant sections — Section 2 (move newly-completed work out of
+   Section 4), Section 3, Section 5 if the schema changed, Section 8, and Section 9 (name the
+   new next step).
 2. Do not let this document drift from the actual repository state. A stale status document
    is worse than none, since it will be trusted.
 3. Follow CLAUDE.md's commit/push/PR ritual for the code changes themselves; update this
-   file in the same commit as the work it describes, not a separate one, so the two never
-   fall out of sync.
+   file in the same commit as the work it describes when possible, so the two never fall out
+   of sync. (Phase 2's own code and this update landed in separate commits on the same PR
+   because of a session interruption — not the ideal pattern, but the PR as a whole still
+   ties them together.)

@@ -122,14 +122,34 @@ type ShutdownConfig struct {
 	Timeout time.Duration
 }
 
+// HTTPConfig configures the shared outbound HTTP client used by discovery
+// and (in later phases) ATS ingestion. MaxResponseBytes bounds how much of
+// a response body is read before erroring, independent of Timeout, which
+// bounds how long that read is allowed to take.
+type HTTPConfig struct {
+	Timeout          time.Duration
+	MaxResponseBytes int64
+	UserAgent        string
+}
+
+// DiscoveryConfig bounds discovery's own concurrency, independent of the
+// database pool or any future ingestion worker pool (CLAUDE.md: "Database
+// and HTTP concurrency should also be bounded" — separately from each
+// other).
+type DiscoveryConfig struct {
+	Workers int
+}
+
 // Config is the fully validated, typed configuration for the aggregator
 // process. Construct it once via Load and pass it down explicitly; nothing
 // in this codebase should read os.Getenv outside this package.
 type Config struct {
-	AppEnv   Environment
-	Database DatabaseConfig
-	Log      LogConfig
-	Shutdown ShutdownConfig
+	AppEnv    Environment
+	Database  DatabaseConfig
+	Log       LogConfig
+	Shutdown  ShutdownConfig
+	HTTP      HTTPConfig
+	Discovery DiscoveryConfig
 }
 
 // Load reads and validates configuration from the process environment.
@@ -211,6 +231,32 @@ func Load() (*Config, error) {
 		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive, got %s", shutdownTimeout))
 	}
 
+	httpTimeout, err := getEnvDuration("HTTP_TIMEOUT", 10*time.Second)
+	if err != nil {
+		errs = append(errs, err)
+	} else if httpTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("HTTP_TIMEOUT must be positive, got %s", httpTimeout))
+	}
+
+	httpMaxResponseBytes, err := getEnvInt64("HTTP_MAX_RESPONSE_SIZE", 5*1024*1024)
+	if err != nil {
+		errs = append(errs, err)
+	} else if httpMaxResponseBytes <= 0 {
+		errs = append(errs, fmt.Errorf("HTTP_MAX_RESPONSE_SIZE must be positive, got %d", httpMaxResponseBytes))
+	}
+
+	httpUserAgent := getEnv("HTTP_USER_AGENT", "remote-job-aggregator/1.0 (+https://github.com/Bantamlak12/remote-job-aggregator)")
+	if strings.TrimSpace(httpUserAgent) == "" {
+		errs = append(errs, errors.New("HTTP_USER_AGENT must not be blank"))
+	}
+
+	discoveryWorkersRaw, err := getEnvInt("DISCOVERY_WORKERS", 5)
+	if err != nil {
+		errs = append(errs, err)
+	} else if discoveryWorkersRaw < 1 || discoveryWorkersRaw > 100 {
+		errs = append(errs, fmt.Errorf("DISCOVERY_WORKERS must be between 1 and 100, got %d", discoveryWorkersRaw))
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: %w", errors.Join(errs...))
 	}
@@ -232,6 +278,14 @@ func Load() (*Config, error) {
 		},
 		Shutdown: ShutdownConfig{
 			Timeout: shutdownTimeout,
+		},
+		HTTP: HTTPConfig{
+			Timeout:          httpTimeout,
+			MaxResponseBytes: httpMaxResponseBytes,
+			UserAgent:        httpUserAgent,
+		},
+		Discovery: DiscoveryConfig{
+			Workers: discoveryWorkersRaw,
 		},
 	}, nil
 }
@@ -291,6 +345,18 @@ func getEnvInt(key string, defaultValue int) (int, error) {
 		return defaultValue, nil
 	}
 	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer, got %q", key, raw)
+	}
+	return v, nil
+}
+
+func getEnvInt64(key string, defaultValue int64) (int64, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return defaultValue, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be an integer, got %q", key, raw)
 	}

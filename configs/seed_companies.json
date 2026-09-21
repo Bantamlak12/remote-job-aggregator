@@ -1,0 +1,16 @@
+[
+  {
+    "company_name": "Spotify",
+    "website": "https://www.spotify.com",
+    "ats_provider": "lever",
+    "external_board_id": "spotify",
+    "board_url": "https://jobs.lever.co/spotify"
+  },
+  {
+    "company_name": "Airbnb",
+    "website": "https://www.airbnb.com",
+    "ats_provider": "greenhouse",
+    "external_board_id": "airbnb",
+    "board_url": "https://boards.greenhouse.io/airbnb"
+  }
+]

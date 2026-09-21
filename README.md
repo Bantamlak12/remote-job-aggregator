@@ -5,10 +5,14 @@ Discovers, normalizes, filters, ranks, and stores remote job postings from
 ATS providers, prioritizing geographic-eligibility correctness (with a
 default focus on Ethiopia) and data quality over raw volume.
 
-**Current status: Phase 1 — foundation.** Config, structured logging, the
-PostgreSQL connection pool, and the migration system exist. There is no
-discovery, ingestion, ATS integration, filtering, ranking, scheduling, or
-notification code yet — those land in later phases.
+**Current status: Phase 2 — company persistence, HTTP infrastructure,
+discovery.** Phase 1 (config, logging, database pool, migrations, CLI
+foundation) is done. Phase 2 adds a repository for companies and their
+ATS boards, a shared pooled/retrying HTTP client, and a seed-file-driven
+discovery mechanism that validates candidate boards and persists the
+ones that check out. There is no ATS integration, ingestion, filtering,
+ranking, scheduling, or notification code yet — those land in later
+phases.
 
 ## Requirements
 
@@ -40,6 +44,9 @@ aggregator migrate-down --yes --all   # roll back EVERY migration, dropping all 
 aggregator migrate-force <version>    # clear a "dirty" schema_migrations state
                                        # after an interrupted migrate-up/-down, without
                                        # running any migration
+aggregator discover [seed-file]       # validate candidate ATS boards from a seed file
+                                       # (default configs/seed_companies.json) and persist
+                                       # the ones that respond
 ```
 
 `migrate-down` always requires `--yes`: rolling back even one migration is
@@ -91,6 +98,10 @@ raw credential even when the value itself was the problem.
 | `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | no | `json` | `json`, `text` |
 | `SHUTDOWN_TIMEOUT` | no | `15s` | max wait during graceful shutdown |
+| `HTTP_TIMEOUT` | no | `10s` | whole-round-trip budget for the shared outbound HTTP client; must be positive |
+| `HTTP_MAX_RESPONSE_SIZE` | no | `5242880` (5 MiB) | bytes; independent of `HTTP_TIMEOUT` — this bounds size, not time; must be positive |
+| `HTTP_USER_AGENT` | no | `remote-job-aggregator/1.0 (+https://github.com/Bantamlak12/remote-job-aggregator)` | sent on every outbound request; must not be blank |
+| `DISCOVERY_WORKERS` | no | `5` | bounded concurrency for discovery's HTTP probes; 1 – 100 |
 | `TEST_DATABASE_URL` | no | — | integration tests only; database name must end in `_test` |
 
 Config values passed via `DATABASE_URL`'s own query string (e.g.
@@ -107,11 +118,12 @@ applied via `golang-migrate` (never automatically at process startup).
 Phase 1 schema:
 
 - **companies** — organizations known to the system. Unique on
-  `lower(name)` and, when present, on a normalized form of `website`
-  (case-folded, trailing slash stripped — it does not normalize `http`
-  vs `https` or `www` vs bare host, since that needs real URL parsing).
+  `lower(btrim(name))` and, when present, on a normalized form of
+  `website` (case-folded, trailing slash stripped — it does not
+  normalize `http` vs `https` or `www` vs bare host, since that needs
+  real URL parsing).
 - **target_companies** — a company's ATS boards. A company may have
-  several. Unique on `(ats_provider, external_board_id)`.
+  several. Unique on `(ats_provider, lower(btrim(external_board_id)))`.
 - **jobs** — normalized postings. Identity is `(source, source_job_id)`
   per the provider's own stable ID, with a `canonical_url` fallback —
   never company name + title (see CLAUDE.md §9). Composite foreign keys
@@ -133,19 +145,74 @@ it until the geographic-classification phase lands.
 ```bash
 make test         # unit tests only — no database required
 docker compose up -d db
-export TEST_DATABASE_URL=postgres://aggregator:aggregator@localhost:5432/aggregator_test
-go test ./...      # now also runs internal/database's integration tests
-make test-race
+make test-integration       # or: TEST_DATABASE_URL=...aggregator_test go test -p 1 ./...
+make test-integration-race
 ```
 
 Database and migration tests run against a real PostgreSQL instance
 (skipped automatically if `TEST_DATABASE_URL` is unset) — they are not
-mocked, per project testing policy. These tests call `migrate-down` and
-drop tables, so `TEST_DATABASE_URL`'s database name **must** end in
-`_test`; the test suite refuses to run otherwise. `docker compose up -d
+mocked, per project testing policy. **`-p 1` is required whenever
+`TEST_DATABASE_URL` is set and more than one package's tests run
+together**: `internal/database`, `internal/company`, and any future
+package with its own DB-integration tests all reset the schema
+(`MigrateDown`/`MigrateUp`) against the *same* `aggregator_test`
+database, and `go test`'s default package-level parallelism runs each
+package's tests as a separate concurrent process with no interlock
+between them — without `-p 1` they will drop each other's tables
+mid-run. `make test-integration`/`test-integration-race` already pass
+it; a bare `go test ./...` with `TEST_DATABASE_URL` set does not and
+will intermittently fail with errors like `relation "companies" does
+not exist` — that failure means this, not a real bug, if it ever shows
+up. These tests call `migrate-down` and drop tables, so
+`TEST_DATABASE_URL`'s database name **must** end in `_test`; the test
+suite refuses to run otherwise. `docker compose up -d
 db` provisions `aggregator_test` alongside the main `aggregator` database
 automatically (see `scripts/postgres-initdb/`) — never point
 `TEST_DATABASE_URL` at the same database `DATABASE_URL` uses.
+
+## Discovery
+
+```bash
+aggregator discover                          # uses configs/seed_companies.json
+aggregator discover path/to/custom_seed.json
+```
+
+The seed file is a JSON array of candidates:
+
+```json
+[
+  {
+    "company_name": "Spotify",
+    "website": "https://www.spotify.com",
+    "ats_provider": "lever",
+    "external_board_id": "spotify",
+    "board_url": "https://jobs.lever.co/spotify"
+  }
+]
+```
+
+`website` is optional; the other four fields are required, and
+`board_url` must be an `http(s)` URL. Every candidate is validated
+before any of them are probed — one bad entry fails the whole load, so a
+typo is caught before wasting HTTP round trips on the rest of the file.
+For each valid candidate, `discover` probes `board_url` (`HEAD`, falling
+back to `GET` — some ATS-hosted boards don't handle `HEAD` reliably per
+the ATS ecosystem generally; the fallback mechanism itself is tested
+against a controlled fake server, but live spot-checks against roughly a
+dozen real Greenhouse/Lever/Ashby boards while building this never
+actually hit one where HEAD and GET disagreed, so it's a defensive
+measure, not something observed to be load-bearing against real traffic
+yet) and, if it responds with any `2xx` status, upserts the
+company and target board. A candidate that doesn't respond is skipped,
+not persisted, and logged — a partial run (some candidates succeed, some
+don't) exits `0`; `discover` only exits non-zero if every candidate
+failed. `configs/seed_companies.json` ships with two real, working
+examples (Spotify on Lever, Airbnb on Greenhouse — both verified live,
+including the redirect chain the Greenhouse one goes through) as a
+starting template.
+
+Concurrency is bounded by `DISCOVERY_WORKERS`, independent of the
+database pool or HTTP client's own connection pool.
 
 ## Docker
 
@@ -157,7 +224,18 @@ docker compose up --build    # PostgreSQL + the aggregator binary
 Postgres's port is published on `127.0.0.1` only. The `app` service waits
 for the database's healthcheck before starting. It does not run
 migrations automatically; run `docker compose run --rm app migrate-up`
-once against a fresh database first.
+once against a fresh database first. `configs/` ships inside the image
+alongside the binary (not just the compiled binary alone), since
+`discover`'s default seed file path is resolved relative to the
+process's working directory.
+
+If you're running from a git worktree (see CLAUDE.md's branching
+workflow), Compose derives its project name from the current directory,
+so `docker compose run --rm app ...` from a worktree tries to start its
+*own* `db` service — which fails on a port collision if another
+Postgres (from the main checkout, or another worktree) is already bound
+to `127.0.0.1:5432`. Either stop the other one first, or run the whole
+stack from the same checkout consistently.
 
 ## Architecture
 
@@ -168,11 +246,27 @@ Modular monolith, one deployable binary. Package boundaries so far:
 - `internal/observability` — `slog` construction.
 - `internal/database` — the `pgxpool` connection pool and the migration
   runner. Nothing else in the codebase touches `pgxpool` directly.
+- `internal/httpclient` — the one pooled, retrying HTTP client every
+  outbound-network package shares (discovery today; ATS ingestion in a
+  later phase). Knows nothing about job boards or providers.
+- `internal/company` — domain types and the only code that writes to
+  `companies`/`target_companies`. `Store`/`TargetStore.Upsert` are each a
+  single atomic `INSERT ... ON CONFLICT`, never a check-then-insert.
+- `internal/discovery` — turns a list of candidate ATS boards
+  (`LoadSeedCandidates`) into persisted companies/targets, via a bounded
+  worker pool over `internal/company`'s repositories and
+  `internal/httpclient`. Depends on both `company` and `httpclient`
+  through small consumer-defined interfaces (`CompanyUpserter`,
+  `TargetUpserter`), not their concrete types, so its own orchestration
+  logic (HEAD/GET fallback, concurrency bound, error propagation) is
+  tested with fakes instead of a database.
 - `migrations/` — versioned SQL, embedded via `go:embed`.
+- `configs/` — operator-editable data files, starting with
+  `seed_companies.json`.
 - `cmd/aggregator` — composition root: wires config → logger → pool,
-  dispatches `run`/`migrate-up`/`migrate-down`/`migrate-force`, handles
-  graceful shutdown.
+  dispatches `run`/`migrate-up`/`migrate-down`/`migrate-force`/`discover`,
+  handles graceful shutdown.
 
-`company`, `discovery`, `ats`, `ingestion`, `job`, `filtering`, `ranking`,
-`notification`, and `scheduler` do not exist yet — they're created when
-the phase that needs them lands, not before.
+`ats`, `ingestion`, `job`, `filtering`, `ranking`, `notification`, and
+`scheduler` do not exist yet — they're created when the phase that needs
+them lands, not before.
