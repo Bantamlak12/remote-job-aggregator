@@ -110,6 +110,48 @@ func TestRunMigrateForce_RequiresExactlyOneVersionArg(t *testing.T) {
 	}
 }
 
+func TestRunDiscover_RejectsTooManyArgs(t *testing.T) {
+	clearRequiredEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/jobs")
+
+	err := run(context.Background(), []string{"discover", "seed.json", "extra"})
+	if err == nil {
+		t.Fatal(`discover with two positional args = nil, want an error`)
+	}
+}
+
+func TestRunDiscover_MissingSeedFileFailsBeforeTouchingTheDatabase(t *testing.T) {
+	clearRequiredEnv(t)
+	// A bad DATABASE_URL that would fail to connect if this ever got that
+	// far — it must not, since the seed file load happens first.
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:1/does-not-exist")
+
+	err := run(context.Background(), []string{"discover", "/nonexistent/seed.json"})
+	if err == nil {
+		t.Fatal("discover with a nonexistent seed file = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "opening seed file") {
+		t.Errorf("error = %q, want it to mention opening the seed file", err.Error())
+	}
+}
+
+func TestRunDiscover_EmptySeedFileSucceedsWithoutTouchingTheDatabase(t *testing.T) {
+	clearRequiredEnv(t)
+	// Same bad DATABASE_URL as above: if an empty candidate list still
+	// tried to connect, this would fail with a connection error instead.
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:1/does-not-exist")
+
+	dir := t.TempDir()
+	path := dir + "/empty.json"
+	if err := os.WriteFile(path, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("writing empty seed file: %v", err)
+	}
+
+	if err := run(context.Background(), []string{"discover", path}); err != nil {
+		t.Errorf("discover with an empty seed file = %v, want nil", err)
+	}
+}
+
 func TestCloseWithTimeout_ReturnsNilOnPromptClose(t *testing.T) {
 	err := closeWithTimeout(time.Second, func() {})
 	if err != nil {

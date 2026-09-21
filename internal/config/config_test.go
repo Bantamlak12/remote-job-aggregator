@@ -15,7 +15,8 @@ func clearAll(t *testing.T) {
 	for _, key := range []string{
 		"APP_ENV", "DATABASE_URL", "DB_MAX_OPEN_CONNS", "DB_MIN_CONNS",
 		"DB_CONN_MAX_LIFETIME", "DB_CONN_MAX_IDLE_TIME", "LOG_LEVEL",
-		"LOG_FORMAT", "SHUTDOWN_TIMEOUT",
+		"LOG_FORMAT", "SHUTDOWN_TIMEOUT", "HTTP_TIMEOUT", "HTTP_MAX_RESPONSE_SIZE",
+		"HTTP_USER_AGENT", "DISCOVERY_WORKERS",
 	} {
 		t.Setenv(key, "")
 	}
@@ -66,6 +67,18 @@ func TestLoad_DefaultsAppliedWhenOnlyRequiredFieldSet(t *testing.T) {
 	if cfg.Shutdown.Timeout != 15*time.Second {
 		t.Errorf("Shutdown.Timeout = %s, want 15s", cfg.Shutdown.Timeout)
 	}
+	if cfg.HTTP.Timeout != 10*time.Second {
+		t.Errorf("HTTP.Timeout = %s, want 10s", cfg.HTTP.Timeout)
+	}
+	if cfg.HTTP.MaxResponseBytes != 5*1024*1024 {
+		t.Errorf("HTTP.MaxResponseBytes = %d, want 5MiB", cfg.HTTP.MaxResponseBytes)
+	}
+	if strings.TrimSpace(cfg.HTTP.UserAgent) == "" {
+		t.Error("HTTP.UserAgent default is blank")
+	}
+	if cfg.Discovery.Workers != 5 {
+		t.Errorf("Discovery.Workers = %d, want 5", cfg.Discovery.Workers)
+	}
 }
 
 func TestLoad_OverridesRespected(t *testing.T) {
@@ -79,6 +92,10 @@ func TestLoad_OverridesRespected(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("LOG_FORMAT", "text")
 	t.Setenv("SHUTDOWN_TIMEOUT", "30s")
+	t.Setenv("HTTP_TIMEOUT", "5s")
+	t.Setenv("HTTP_MAX_RESPONSE_SIZE", "1048576")
+	t.Setenv("HTTP_USER_AGENT", "custom-agent/1.0")
+	t.Setenv("DISCOVERY_WORKERS", "20")
 
 	cfg, err := Load()
 	if err != nil {
@@ -105,6 +122,95 @@ func TestLoad_OverridesRespected(t *testing.T) {
 	}
 	if cfg.Shutdown.Timeout != 30*time.Second {
 		t.Errorf("Shutdown.Timeout = %s, want 30s", cfg.Shutdown.Timeout)
+	}
+	if cfg.HTTP.Timeout != 5*time.Second {
+		t.Errorf("HTTP.Timeout = %s, want 5s", cfg.HTTP.Timeout)
+	}
+	if cfg.HTTP.MaxResponseBytes != 1048576 {
+		t.Errorf("HTTP.MaxResponseBytes = %d, want 1048576", cfg.HTTP.MaxResponseBytes)
+	}
+	if cfg.HTTP.UserAgent != "custom-agent/1.0" {
+		t.Errorf("HTTP.UserAgent = %q, want %q", cfg.HTTP.UserAgent, "custom-agent/1.0")
+	}
+	if cfg.Discovery.Workers != 20 {
+		t.Errorf("Discovery.Workers = %d, want 20", cfg.Discovery.Workers)
+	}
+}
+
+func TestLoad_ZeroHTTPTimeoutRejected(t *testing.T) {
+	clearAll(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/jobs")
+	t.Setenv("HTTP_TIMEOUT", "0s")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for HTTP_TIMEOUT=0s, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP_TIMEOUT must be positive") {
+		t.Errorf("error = %q, want it to mention HTTP_TIMEOUT must be positive", err.Error())
+	}
+}
+
+func TestLoad_NegativeHTTPMaxResponseSizeRejected(t *testing.T) {
+	clearAll(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/jobs")
+	t.Setenv("HTTP_MAX_RESPONSE_SIZE", "-1")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for negative HTTP_MAX_RESPONSE_SIZE, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP_MAX_RESPONSE_SIZE must be positive") {
+		t.Errorf("error = %q, want it to mention HTTP_MAX_RESPONSE_SIZE must be positive", err.Error())
+	}
+}
+
+func TestLoad_HTTPMaxResponseSizeBeyondInt32IsAccepted(t *testing.T) {
+	// Regression guard: MaxResponseBytes is int64 specifically so response
+	// size limits aren't accidentally capped the way pool sizes are — a
+	// limit larger than 2^31 must not be rejected or truncated.
+	clearAll(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/jobs")
+	t.Setenv("HTTP_MAX_RESPONSE_SIZE", "4294967296") // 4GiB, > math.MaxInt32
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if cfg.HTTP.MaxResponseBytes != 4294967296 {
+		t.Errorf("HTTP.MaxResponseBytes = %d, want 4294967296", cfg.HTTP.MaxResponseBytes)
+	}
+}
+
+func TestLoad_BlankHTTPUserAgentRejected(t *testing.T) {
+	clearAll(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/jobs")
+	t.Setenv("HTTP_USER_AGENT", "   ")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for blank HTTP_USER_AGENT, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP_USER_AGENT must not be blank") {
+		t.Errorf("error = %q, want it to mention HTTP_USER_AGENT must not be blank", err.Error())
+	}
+}
+
+func TestLoad_DiscoveryWorkersOutOfRangeRejected(t *testing.T) {
+	clearAll(t)
+	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/jobs")
+
+	for _, v := range []string{"0", "101", "-1"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("DISCOVERY_WORKERS", v)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for DISCOVERY_WORKERS=%s, got nil", v)
+			}
+			if !strings.Contains(err.Error(), "DISCOVERY_WORKERS must be between") {
+				t.Errorf("error = %q, want it to mention the valid range", err.Error())
+			}
+		})
 	}
 }
 

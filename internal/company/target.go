@@ -1,0 +1,200 @@
+package company
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// TargetCompany is one row of target_companies: a single ATS board
+// belonging to a company. A company can have several (one per provider,
+// or several boards on one provider), which is why this is its own table
+// and not columns on companies.
+type TargetCompany struct {
+	ID              int64
+	CompanyID       int64
+	ATSProvider     string
+	ExternalBoardID string
+	// BoardURL is "" when the column is NULL, matching Company.Website.
+	BoardURL string
+	// DiscoveryMetadata is the decoded discovery_metadata JSONB column:
+	// whatever the discovery pass wants to remember about how this board
+	// was found. The column is NOT NULL DEFAULT '{}', so this is an empty
+	// map, never nil, for a row that has never had metadata written.
+	DiscoveryMetadata         map[string]any
+	IsActive                  bool
+	LastSuccessfulIngestionAt *time.Time
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
+}
+
+// TargetUpsertParams is the input to TargetStore.Upsert.
+//
+// DiscoveryMetadata is tri-state on purpose: a nil map means "leave
+// whatever is stored alone", while a non-nil map (including an empty
+// one) replaces the stored value outright. Discovery passes that learn
+// nothing new about a board should not have to re-send its metadata to
+// avoid clobbering it.
+type TargetUpsertParams struct {
+	CompanyID         int64
+	ATSProvider       string
+	ExternalBoardID   string
+	BoardURL          string
+	DiscoveryMetadata map[string]any
+}
+
+// TargetStore is the repository for the target_companies table.
+type TargetStore struct {
+	pool *pgxpool.Pool
+}
+
+// NewTargetStore returns a TargetStore backed by pool. The pool is owned
+// by the caller and is not closed here.
+func NewTargetStore(pool *pgxpool.Pool) *TargetStore {
+	return &TargetStore{pool: pool}
+}
+
+// targetColumns is the column list every query in this file selects, in
+// the order scanTarget expects.
+const targetColumns = `id, company_id, ats_provider, external_board_id, board_url,
+	discovery_metadata, is_active, last_successful_ingestion_at, created_at, updated_at`
+
+// upsertTargetQuery is atomic for the same reason upsertCompanyQuery is:
+// two discovery workers can hit the same provider+board at once, and
+// PostgreSQL is the only participant that can order them.
+//
+// The conflict target matches target_companies_provider_board_idx
+// exactly — a plain column plus an expression — because index inference
+// compares the whole target, not each element loosely.
+//
+// Three deliberate differences from the company upsert:
+//
+//   - is_active is forced back to true. Re-discovering a board means it
+//     responded, and there is no operator UI that could have deactivated
+//     it on purpose yet, so "discovery found it again" wins over a
+//     previous deactivation (which today only comes from ingestion
+//     failures).
+//   - board_url takes EXCLUDED first, so a freshly discovered URL
+//     replaces a stale one; a blank parameter becomes NULL via NULLIF and
+//     the COALESCE then keeps what is already stored. This is the
+//     opposite precedence from companies.website, where a second opinion
+//     about an employer's site is not evidence the first one was wrong —
+//     here the board URL comes from the same probe that just proved the
+//     board exists.
+//   - discovery_metadata is replaced wholesale from $5 rather than from
+//     EXCLUDED.discovery_metadata: the VALUES clause has already turned a
+//     nil parameter into '{}' to satisfy the NOT NULL column, so EXCLUDED
+//     could no longer tell "no metadata supplied" from "empty metadata
+//     supplied". $5 still can.
+const upsertTargetQuery = `
+	INSERT INTO target_companies (company_id, ats_provider, external_board_id, board_url, discovery_metadata)
+	VALUES ($1, $2, $3, NULLIF($4, ''), COALESCE($5::jsonb, '{}'::jsonb))
+	ON CONFLICT (ats_provider, lower(btrim(external_board_id))) DO UPDATE SET
+		is_active          = true,
+		board_url          = COALESCE(EXCLUDED.board_url, target_companies.board_url),
+		discovery_metadata = COALESCE($5::jsonb, target_companies.discovery_metadata)
+	RETURNING ` + targetColumns
+
+// Upsert registers an ATS board for a company, or updates the existing
+// row for that provider+board id (case- and whitespace-insensitively),
+// returning the full row either way.
+//
+// CompanyID is validated but not checked for existence: the foreign key
+// does that, and a SELECT here would be both a wasted round trip and a
+// TOCTOU window (the company could be deleted between the check and the
+// insert).
+func (s *TargetStore) Upsert(ctx context.Context, params TargetUpsertParams) (*TargetCompany, error) {
+	if params.CompanyID <= 0 {
+		return nil, fmt.Errorf("company: target upsert: company_id must be positive, got %d", params.CompanyID)
+	}
+	provider := strings.TrimSpace(params.ATSProvider)
+	if provider == "" {
+		return nil, errors.New("company: target upsert: ats_provider is required")
+	}
+	boardID := strings.TrimSpace(params.ExternalBoardID)
+	if boardID == "" {
+		return nil, errors.New("company: target upsert: external_board_id is required")
+	}
+
+	// nil stays nil so pgx sends SQL NULL for $5, which is what both
+	// COALESCEs in the query test for. Marshaling a nil map instead would
+	// send the four bytes "null", a perfectly valid jsonb value that is
+	// not NULL and would therefore overwrite the stored metadata.
+	var metadata []byte
+	if params.DiscoveryMetadata != nil {
+		b, err := json.Marshal(params.DiscoveryMetadata)
+		if err != nil {
+			return nil, fmt.Errorf("company: target upsert: encoding discovery metadata: %w", err)
+		}
+		metadata = b
+	}
+
+	t, err := scanTarget(s.pool.QueryRow(ctx, upsertTargetQuery,
+		params.CompanyID,
+		provider,
+		boardID,
+		strings.TrimSpace(params.BoardURL),
+		metadata,
+	))
+	if err != nil {
+		return nil, fmt.Errorf("company: upserting target %s/%s: %w", provider, boardID, err)
+	}
+	return t, nil
+}
+
+const getTargetByIDQuery = `SELECT ` + targetColumns + ` FROM target_companies WHERE id = $1`
+
+// GetByID returns the target company with the given id, or an error
+// wrapping ErrNotFound if there is none.
+func (s *TargetStore) GetByID(ctx context.Context, id int64) (*TargetCompany, error) {
+	t, err := scanTarget(s.pool.QueryRow(ctx, getTargetByIDQuery, id))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("company: get target by id %d: %w", id, ErrNotFound)
+		}
+		return nil, fmt.Errorf("company: get target by id %d: %w", id, err)
+	}
+	return t, nil
+}
+
+// scanTarget reads one row in targetColumns order. discovery_metadata is
+// scanned as raw bytes and decoded here rather than letting pgx decode
+// straight into the map, so a malformed value reports which column it
+// came from instead of surfacing as a bare json error.
+func scanTarget(row pgx.Row) (*TargetCompany, error) {
+	var (
+		t        TargetCompany
+		boardURL *string
+		metadata []byte
+	)
+	err := row.Scan(
+		&t.ID,
+		&t.CompanyID,
+		&t.ATSProvider,
+		&t.ExternalBoardID,
+		&boardURL,
+		&metadata,
+		&t.IsActive,
+		&t.LastSuccessfulIngestionAt,
+		&t.CreatedAt,
+		&t.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if boardURL != nil {
+		t.BoardURL = *boardURL
+	}
+	if len(metadata) > 0 {
+		if err := json.Unmarshal(metadata, &t.DiscoveryMetadata); err != nil {
+			return nil, fmt.Errorf("decoding discovery_metadata: %w", err)
+		}
+	}
+	return &t, nil
+}

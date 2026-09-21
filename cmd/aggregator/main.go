@@ -15,13 +15,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Bantamlak12/remote-job-aggregator/internal/company"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/config"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/database"
+	"github.com/Bantamlak12/remote-job-aggregator/internal/discovery"
+	"github.com/Bantamlak12/remote-job-aggregator/internal/httpclient"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/observability"
 	"github.com/Bantamlak12/remote-job-aggregator/migrations"
 )
 
-const usage = "usage: aggregator <run|migrate-up|migrate-down --yes [--all]|migrate-force <version>>"
+const usage = "usage: aggregator <run|migrate-up|migrate-down --yes [--all]|migrate-force <version>|discover [seed-file]>"
+
+const defaultSeedFile = "configs/seed_companies.json"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -99,7 +104,7 @@ func run(ctx context.Context, args []string) error {
 
 	cmd, rest := args[0], args[1:]
 	switch cmd {
-	case "run", "migrate-up", "migrate-down", "migrate-force":
+	case "run", "migrate-up", "migrate-down", "migrate-force", "discover":
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		return fmt.Errorf("unknown command %q: %s", cmd, usage)
@@ -135,6 +140,8 @@ func run(ctx context.Context, args []string) error {
 		return runMigrateForce(cfg, logger, rest)
 	case "run":
 		return runApp(ctx, cfg, logger)
+	case "discover":
+		return runDiscover(ctx, cfg, logger, rest)
 	}
 	return nil // unreachable: cmd was validated above
 }
@@ -216,6 +223,73 @@ func runMigrateForce(cfg *config.Config, logger *slog.Logger, args []string) err
 		return err
 	}
 	logger.Info("migration version forced", "version", version)
+	return nil
+}
+
+// runDiscover loads candidates from a seed file (configs/seed_companies.json
+// by default) and runs discovery against them, persisting the companies
+// and target boards that validate. It exits non-zero only if every
+// candidate failed — a mix of successes and failures is discovery's
+// normal steady state (a board can go away at any time) and must not
+// fail a cron-style invocation of this command.
+func runDiscover(ctx context.Context, cfg *config.Config, logger *slog.Logger, args []string) error {
+	if len(args) > 1 {
+		err := errors.New("discover: usage: discover [seed-file]")
+		logger.Error(err.Error())
+		return err
+	}
+	seedPath := defaultSeedFile
+	if len(args) == 1 {
+		seedPath = args[0]
+	}
+
+	candidates, err := discovery.LoadSeedCandidates(seedPath)
+	if err != nil {
+		logger.Error("loading seed candidates failed", "error", err)
+		return err
+	}
+	logger.Info("loaded seed candidates", "count", len(candidates), "seed_file", seedPath)
+	if len(candidates) == 0 {
+		logger.Info("no candidates to discover")
+		return nil
+	}
+
+	db, err := database.New(ctx, cfg.Database)
+	if err != nil {
+		logger.Error("connecting to database failed", "error", err)
+		return fmt.Errorf("connecting to database: %w", err)
+	}
+	defer db.Close()
+
+	httpCfg := httpclient.DefaultConfig()
+	httpCfg.Timeout = cfg.HTTP.Timeout
+	httpCfg.MaxResponseBytes = cfg.HTTP.MaxResponseBytes
+	httpCfg.UserAgent = cfg.HTTP.UserAgent
+
+	d := discovery.New(
+		company.NewStore(db.Pool),
+		company.NewTargetStore(db.Pool),
+		httpclient.New(httpCfg),
+		cfg.Discovery.Workers,
+		logger,
+	)
+
+	results := d.Run(ctx, candidates)
+
+	var succeeded, failed int
+	for _, r := range results {
+		if r.Err != nil {
+			failed++
+			logger.Warn("candidate not discovered", "company", r.Candidate.CompanyName, "board_url", r.Candidate.BoardURL, "error", r.Err)
+			continue
+		}
+		succeeded++
+	}
+	logger.Info("discovery run complete", "total", len(results), "succeeded", succeeded, "failed", failed)
+
+	if succeeded == 0 {
+		return fmt.Errorf("discover: all %d candidate(s) failed", len(results))
+	}
 	return nil
 }
 
