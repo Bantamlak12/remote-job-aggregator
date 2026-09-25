@@ -50,7 +50,8 @@ the board's own page for the job and the board asks to be credited; the UI print
 **Markets.** Every job belongs to one of two lists, reported as `"market"`: `"ethiopia"` (jobs
 in Ethiopia or from Ethiopian employers: the Ethiopian category in the UI) or `"worldwide"`
 (companies hiring across borders: the main page). The market comes from the source the job was
-collected through, so one company can appear in both lists. `market=ethiopia` or
+collected through, so one company can appear in both lists; the exception is a priority (Ethiopian)
+company, whose jobs are always `"ethiopia"`, so they are never in the worldwide list. `market=ethiopia` or
 `market=worldwide` narrows a list to one; omitting it returns both. Additive change: the field
 is new and the parameter is optional.
 
@@ -70,7 +71,7 @@ Query params (all optional):
 | `company` | string | Exact company name match |
 | `tag` | string | Job must have this tag |
 | `market` | string | `ethiopia` or `worldwide` returns only that list; omitted returns both. Anything else is a `400` |
-| `priority` | string | `true` returns only jobs from priority (Ethiopian) companies. `false` is the same as omitting the parameter (it does **not** mean "only non-priority"), so a UI toggle can send its state verbatim. Anything else is a `400` |
+| `priority` | string | `true` returns only jobs from priority (Ethiopian) companies. `false` is the same as omitting the parameter (it does **not** mean "only non-priority"), so a UI toggle can send its state verbatim. The web UI does not use this parameter (it splits by `market`); it stays for API clients. Anything else is a `400` |
 | `page` | int | Default `1` |
 | `page_size` | int | Default `20`, max `100` |
 
