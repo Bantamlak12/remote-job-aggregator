@@ -33,6 +33,11 @@ type Candidate struct {
 	ATSProvider     string `json:"ats_provider"`
 	ExternalBoardID string `json:"external_board_id"`
 	BoardURL        string `json:"board_url"`
+	// Verified says the caller has already proven the board exists and is the
+	// company's (through the ATS's own API), so the page probe, which only
+	// checks that a public page answers, is skipped: it can add failures (a
+	// page that blocks HEAD and GET) but no proof.
+	Verified bool `json:"-"`
 }
 
 // validate checks the fields Discoverer itself relies on being present
@@ -170,16 +175,24 @@ func (d *Discoverer) Run(ctx context.Context, candidates []Candidate) []Result {
 	return out
 }
 
+// SourceDiscoverBoards is the discovery_metadata "source" of a board registered
+// by discover-boards (a Verified candidate).
+const SourceDiscoverBoards = "discover-boards"
+
 func (d *Discoverer) process(ctx context.Context, c Candidate) Result {
 	if err := c.validate(); err != nil {
 		return Result{Candidate: c, Err: fmt.Errorf("discovery: invalid candidate %q: %w", c.CompanyName, err)}
 	}
 
-	statusCode, method, err := d.probe(ctx, c.BoardURL)
-	if err != nil {
-		d.logger.Warn("discovery: candidate failed validation",
-			"company", c.CompanyName, "ats_provider", c.ATSProvider, "board_url", c.BoardURL, "error", err)
-		return Result{Candidate: c, Err: fmt.Errorf("discovery: validating %s: %w", c.BoardURL, err)}
+	statusCode, method := 0, "verified-by-api"
+	if !c.Verified {
+		var err error
+		statusCode, method, err = d.probe(ctx, c.BoardURL)
+		if err != nil {
+			d.logger.Warn("discovery: candidate failed validation",
+				"company", c.CompanyName, "ats_provider", c.ATSProvider, "board_url", c.BoardURL, "error", err)
+			return Result{Candidate: c, Err: fmt.Errorf("discovery: validating %s: %w", c.BoardURL, err)}
+		}
 	}
 
 	comp, err := d.companies.Upsert(ctx, company.UpsertParams{
@@ -190,16 +203,23 @@ func (d *Discoverer) process(ctx context.Context, c Candidate) Result {
 		return Result{Candidate: c, Err: fmt.Errorf("discovery: upserting company %q: %w", c.CompanyName, err)}
 	}
 
+	metadata := map[string]any{
+		"validated_at":      time.Now().UTC().Format(time.RFC3339),
+		"validation_method": method,
+		"status_code":       statusCode,
+	}
+	if c.Verified {
+		// The board was registered on the strength of a name look-up. Only such
+		// boards are ever deactivated by a later `discover-boards --recheck`: a
+		// board a person seeded is theirs to judge.
+		metadata["source"] = SourceDiscoverBoards
+	}
 	target, err := d.targets.Upsert(ctx, company.TargetUpsertParams{
-		CompanyID:       comp.ID,
-		ATSProvider:     c.ATSProvider,
-		ExternalBoardID: c.ExternalBoardID,
-		BoardURL:        c.BoardURL,
-		DiscoveryMetadata: map[string]any{
-			"validated_at":      time.Now().UTC().Format(time.RFC3339),
-			"validation_method": method,
-			"status_code":       statusCode,
-		},
+		CompanyID:         comp.ID,
+		ATSProvider:       c.ATSProvider,
+		ExternalBoardID:   c.ExternalBoardID,
+		BoardURL:          c.BoardURL,
+		DiscoveryMetadata: metadata,
 	})
 	if err != nil {
 		return Result{Candidate: c, Company: comp, Err: fmt.Errorf("discovery: upserting target %s/%s: %w", c.ATSProvider, c.ExternalBoardID, err)}
