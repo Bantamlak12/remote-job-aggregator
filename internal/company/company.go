@@ -223,3 +223,125 @@ func scanCompany(row pgx.Row) (*Company, error) {
 	c.Status = Status(status)
 	return &c, nil
 }
+
+const namesWithoutBoardQuery = `
+	SELECT DISTINCT c.name
+	FROM companies c
+	JOIN target_companies t ON t.company_id = c.id AND t.ats_provider = ANY($1)
+	WHERE NOT EXISTS (
+		SELECT 1 FROM target_companies b WHERE b.company_id = c.id AND b.ats_provider = ANY($2) AND b.is_active
+	)
+	ORDER BY c.name
+	LIMIT $3`
+
+// NamesWithoutBoard lists the names of companies that have a target from one
+// of sourceProviders (a job board that names its employers) and none from any
+// of boardProviders (an ATS that would list all of the company's jobs
+// itself); a deactivated board does not count. Discovery uses it to look for the ATS board of every employer a
+// job board has shown. limit bounds the result.
+func (s *Store) NamesWithoutBoard(ctx context.Context, sourceProviders, boardProviders []string, limit int) ([]string, error) {
+	rows, err := s.pool.Query(ctx, namesWithoutBoardQuery, sourceProviders, boardProviders, limit)
+	if err != nil {
+		return nil, fmt.Errorf("company: listing names without a board: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, fmt.Errorf("company: scanning a name: %w", err)
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
+const namesWithBoardQuery = `
+	SELECT DISTINCT c.name FROM companies c
+	JOIN target_companies t ON t.company_id = c.id AND t.ats_provider = ANY($1) AND t.is_active`
+
+// NamesWithBoard lists the names of companies that already have an active
+// target from one of boardProviders. Discovery uses it to leave those
+// companies alone; a board that was deactivated (it stopped verifying) does not
+// count, so the company can be looked up again.
+func (s *Store) NamesWithBoard(ctx context.Context, boardProviders []string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, namesWithBoardQuery, boardProviders)
+	if err != nil {
+		return nil, fmt.Errorf("company: listing names with a board: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, fmt.Errorf("company: scanning a name: %w", err)
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
+const namesWithSourceAndBoardQuery = `
+	SELECT DISTINCT c.name
+	FROM companies c
+	JOIN target_companies s ON s.company_id = c.id AND s.ats_provider = ANY($1)
+	JOIN target_companies b ON b.company_id = c.id AND b.ats_provider = ANY($2) AND b.is_active
+	ORDER BY c.name`
+
+// NamesWithSourceAndBoard lists the names of companies that a job board
+// (sourceProviders) showed and that have an ATS board (boardProviders): the
+// boards discovery registered from employer names, which it re-checks.
+func (s *Store) NamesWithSourceAndBoard(ctx context.Context, sourceProviders, boardProviders []string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, namesWithSourceAndBoardQuery, sourceProviders, boardProviders)
+	if err != nil {
+		return nil, fmt.Errorf("company: listing names with a source and a board: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, fmt.Errorf("company: scanning a name: %w", err)
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
+const jobTitlesByCompanyQuery = `
+	SELECT lower(c.name), j.title
+	FROM jobs j
+	JOIN companies c ON c.id = j.company_id
+	WHERE j.source = ANY($1) AND lower(c.name) = ANY($2)
+	GROUP BY lower(c.name), j.title
+	ORDER BY lower(c.name), j.title`
+
+// maxTitlesPerCompany bounds what JobTitlesByCompany returns for one company.
+const maxTitlesPerCompany = 500
+
+// JobTitlesByCompany returns, for each named company (keyed by its lower-cased
+// name), the distinct titles of the jobs the given sources (job boards) hold
+// for it, open or not. Discovery compares them with the titles on a candidate
+// ATS board: a same-named company's board lists other jobs.
+func (s *Store) JobTitlesByCompany(ctx context.Context, sources, names []string) (map[string][]string, error) {
+	lower := make([]string, len(names))
+	for i, n := range names {
+		lower[i] = strings.ToLower(strings.TrimSpace(n))
+	}
+	rows, err := s.pool.Query(ctx, jobTitlesByCompanyQuery, sources, lower)
+	if err != nil {
+		return nil, fmt.Errorf("company: listing job titles by company: %w", err)
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var name, title string
+		if err := rows.Scan(&name, &title); err != nil {
+			return nil, fmt.Errorf("company: scanning a job title: %w", err)
+		}
+		if len(out[name]) < maxTitlesPerCompany {
+			out[name] = append(out[name], title)
+		}
+	}
+	return out, rows.Err()
+}

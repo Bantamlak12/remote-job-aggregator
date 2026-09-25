@@ -247,6 +247,50 @@ func TestListJobs_PublishedAtNeverFallsBackToUpdatedAt(t *testing.T) {
 	}
 }
 
+// The location text is the only workplace signal a Greenhouse posting has.
+func TestWorkplaceFromLocation(t *testing.T) {
+	for location, want := range map[string]string{
+		"Remote, Bangalore":             "remote", // a real GitLab location
+		"REMOTE - US":                   "remote",
+		"US-Remote":                     "remote",
+		"Remote":                        "remote",
+		"Hybrid, London":                "hybrid",
+		"Atlanta - Hybrid; Remote (US)": "hybrid", // an office role: hybrid wins
+		"San Francisco, CA":             "",
+		"Remoteville, TX":               "",
+		"Non-remote":                    "",
+		"Not remote":                    "",
+		"Remote-Friendly (Travel-Required) | San Francisco": "",
+		"Remote-first HQ in Berlin":                         "",
+		"":                                                  "",
+	} {
+		if got := workplaceFromLocation(location); got != want {
+			t.Errorf("workplaceFromLocation(%q) = %q, want %q", location, got, want)
+		}
+	}
+}
+
+func TestListJobs_ReadsRemoteAndHybridFromTheLocationText(t *testing.T) {
+	c, base := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jobs":[
+		 {"id":1,"title":"A","absolute_url":"https://x.test/1","location":{"name":"Remote, Bangalore"}},
+		 {"id":2,"title":"B","absolute_url":"https://x.test/2","location":{"name":"Hybrid, London"}},
+		 {"id":3,"title":"C","absolute_url":"https://x.test/3","location":{"name":"San Francisco, CA"}}
+		]}`))
+	})
+	withTestEndpoint(t, base)
+	jobs, err := c.ListJobs(context.Background(), "acme")
+	if err != nil || len(jobs) != 3 {
+		t.Fatalf("ListJobs() = %v, %v", jobs, err)
+	}
+	for i, want := range []string{"remote", "hybrid", ""} {
+		if jobs[i].RemoteType != want {
+			t.Errorf("%s: RemoteType = %q, want %q", jobs[i].Title, jobs[i].RemoteType, want)
+		}
+	}
+}
+
 func TestListJobs_MissingIDBecomesEmptyExternalIDNotZero(t *testing.T) {
 	c, base := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

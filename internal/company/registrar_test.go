@@ -3,6 +3,7 @@ package company_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -210,5 +211,193 @@ func TestRegistrar_MarketIsSetDefaultedAndNeverResetBySilence(t *testing.T) {
 	}
 	if _, err := reg.EnsureTarget(ctx, "ethiojobs", "Bad Co", false, "mars"); err == nil {
 		t.Errorf("an unknown market was accepted")
+	}
+}
+
+func TestNamesWithoutBoard_ListsCompaniesAJobBoardShowedThatHaveNoATSBoardYet(t *testing.T) {
+	ctx := context.Background()
+	reg, cs, ts := newRegistrar(t)
+
+	board := func(provider, employer string) int64 {
+		t.Helper()
+		tg, err := reg.EnsureTarget(ctx, provider, employer, false, "")
+		if err != nil {
+			t.Fatalf("EnsureTarget(%s, %s): %v", provider, employer, err)
+		}
+		return tg.CompanyID
+	}
+	board("himalayas", "Alpha")   // shown by a board, no ATS board: listed
+	board("remotive", "Bravo")    // same
+	board("himalayas", "Charlie") // shown by a board, but has a Lever board: not listed
+	board("lever", "Charlie")
+	board("greenhouse", "Delta") // an ATS board only, never shown by a job board: not listed
+	board("ethiojobs", "Echo")   // shown by a source that is not one of the given boards: not listed
+	alpha, _ := cs.GetByName(ctx, "Alpha")
+	if _, err := ts.Upsert(ctx, company.TargetUpsertParams{CompanyID: alpha.ID, ATSProvider: "jobicy", ExternalBoardID: "alpha jobicy"}); err != nil {
+		t.Fatalf("second board target: %v", err)
+	}
+
+	got, err := cs.NamesWithoutBoard(ctx, []string{"himalayas", "remotive", "jobicy"}, []string{"greenhouse", "lever", "ashby"}, 100)
+	if err != nil {
+		t.Fatalf("NamesWithoutBoard() failed: %v", err)
+	}
+	if want := []string{"Alpha", "Bravo"}; !slices.Equal(got, want) {
+		t.Errorf("names = %v, want %v (each once, alphabetical)", got, want)
+	}
+	if got, _ := cs.NamesWithoutBoard(ctx, []string{"himalayas", "remotive"}, []string{"lever"}, 1); len(got) != 1 {
+		t.Errorf("limit 1 returned %v", got)
+	}
+}
+
+func TestListByCompanyNames_FindsTheNamedCompaniesBoardsOfTheGivenProviders(t *testing.T) {
+	ctx := context.Background()
+	reg, _, ts := newRegistrar(t)
+	mk := func(provider, name string) {
+		t.Helper()
+		if _, err := reg.EnsureTarget(ctx, provider, name, false, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("greenhouse", "Alpha")
+	mk("lever", "Alpha")
+	mk("himalayas", "Alpha") // not an ATS provider asked for
+	mk("ashby", "Bravo")
+	mk("ashby", "Charlie") // not asked for
+
+	got, err := ts.ListByCompanyNames(ctx, []string{" alpha ", "BRAVO", "nobody"}, []string{"greenhouse", "lever", "ashby"})
+	if err != nil {
+		t.Fatalf("ListByCompanyNames() failed: %v", err)
+	}
+	var keys []string
+	for _, tg := range got {
+		keys = append(keys, tg.CompanyName+" "+tg.ATSProvider+"/"+tg.ExternalBoardID)
+	}
+	want := []string{"Alpha greenhouse/alpha", "Alpha lever/alpha", "Bravo ashby/bravo"}
+	if !slices.Equal(keys, want) {
+		t.Errorf("targets = %v, want %v", keys, want)
+	}
+	if !got[0].IsActive {
+		t.Errorf("IsActive not read")
+	}
+}
+
+func TestListByCompanyNames_ReadsTheDiscoverySource(t *testing.T) {
+	ctx := context.Background()
+	_, cs, ts := newRegistrar(t)
+	a, err := cs.Upsert(ctx, company.UpsertParams{Name: "Alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ts.Upsert(ctx, company.TargetUpsertParams{CompanyID: a.ID, ATSProvider: "lever", ExternalBoardID: "alpha",
+		DiscoveryMetadata: map[string]any{"source": "discover-boards"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ts.Upsert(ctx, company.TargetUpsertParams{CompanyID: a.ID, ATSProvider: "ashby", ExternalBoardID: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ts.ListByCompanyNames(ctx, []string{"alpha"}, []string{"lever", "ashby"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := map[string]string{}
+	for _, tg := range got {
+		sources[tg.ATSProvider] = tg.Source
+	}
+	if sources["lever"] != "discover-boards" || sources["ashby"] != "" || len(got) != 2 {
+		t.Errorf("sources = %v, want lever=discover-boards and ashby empty", sources)
+	}
+}
+
+func TestJobTitlesByCompany_ReturnsTheDistinctTitlesTheGivenSourcesHold(t *testing.T) {
+	ctx := context.Background()
+	db := newDB(t)
+	cs, ts := company.NewStore(db.Pool), company.NewTargetStore(db.Pool)
+	reg := company.NewRegistrar(cs, ts)
+	add := func(provider, name, jobID, title string) {
+		t.Helper()
+		tg, err := reg.EnsureTarget(ctx, provider, name, false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO jobs (company_id, target_company_id, source, source_job_id, title, application_url, content_hash)
+			VALUES ($1, $2, $3, $4, $5, 'https://example.com/x', 'h')`, tg.CompanyID, tg.ID, provider, jobID, title); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("himalayas", "Alpha", "1", "Backend Engineer")
+	add("remotive", "Alpha", "2", "Backend Engineer") // the same title from another board: once
+	add("remotive", "Alpha", "3", "Designer")
+	add("lever", "Alpha", "4", "From The Company's Own Board") // not a job board source
+	add("himalayas", "Bravo", "5", "Chef")
+	add("himalayas", "Charlie", "6", "Not asked for")
+
+	got, err := cs.JobTitlesByCompany(ctx, []string{"himalayas", "remotive"}, []string{" ALPHA ", "bravo", "nobody"})
+	if err != nil {
+		t.Fatalf("JobTitlesByCompany() failed: %v", err)
+	}
+	want := map[string][]string{"alpha": {"Backend Engineer", "Designer"}, "bravo": {"Chef"}}
+	if len(got) != len(want) {
+		t.Fatalf("titles = %v, want %v", got, want)
+	}
+	for k, w := range want {
+		if !slices.Equal(got[k], w) {
+			t.Errorf("titles[%q] = %v, want %v", k, got[k], w)
+		}
+	}
+}
+
+func TestNamesWithBoard_AndWithSourceAndBoard(t *testing.T) {
+	ctx := context.Background()
+	reg, cs, _ := newRegistrar(t)
+	mk := func(provider, name string) {
+		t.Helper()
+		if _, err := reg.EnsureTarget(ctx, provider, name, false, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("himalayas", "Alpha")
+	mk("lever", "Alpha")       // shown by a board, and has a board: in both lists
+	mk("greenhouse", "Bravo")  // a board only
+	mk("himalayas", "Charlie") // shown by a board only
+
+	atsProviders := []string{"greenhouse", "lever", "ashby"}
+	got, err := cs.NamesWithBoard(ctx, atsProviders)
+	if err != nil || !slices.Equal(got, []string{"Alpha", "Bravo"}) && !slices.Equal(got, []string{"Bravo", "Alpha"}) {
+		t.Errorf("NamesWithBoard = %v, %v; want Alpha and Bravo", got, err)
+	}
+	got, err = cs.NamesWithSourceAndBoard(ctx, []string{"himalayas"}, atsProviders)
+	if err != nil || !slices.Equal(got, []string{"Alpha"}) {
+		t.Errorf("NamesWithSourceAndBoard = %v, %v; want Alpha only", got, err)
+	}
+}
+
+func TestNamesWithBoard_AnInactiveBoardDoesNotCount(t *testing.T) {
+	ctx := context.Background()
+	reg, cs, ts := newRegistrar(t)
+	tg, err := reg.EnsureTarget(ctx, "ashby", "Delta", false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.EnsureTarget(ctx, "himalayas", "Delta", false, ""); err != nil {
+		t.Fatal(err)
+	}
+	atsProviders := []string{"greenhouse", "lever", "ashby"}
+	if got, _ := cs.NamesWithBoard(ctx, atsProviders); !slices.Equal(got, []string{"Delta"}) {
+		t.Fatalf("active board: NamesWithBoard = %v, want Delta", got)
+	}
+	if got, _ := cs.NamesWithoutBoard(ctx, []string{"himalayas"}, atsProviders, 10); len(got) != 0 {
+		t.Fatalf("active board: NamesWithoutBoard = %v, want none", got)
+	}
+	if err := ts.SetActive(ctx, tg.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := cs.NamesWithBoard(ctx, atsProviders); len(got) != 0 {
+		t.Errorf("inactive board: NamesWithBoard = %v, want none (the company can be looked up again)", got)
+	}
+	if got, _ := cs.NamesWithoutBoard(ctx, []string{"himalayas"}, atsProviders, 10); !slices.Equal(got, []string{"Delta"}) {
+		t.Errorf("inactive board: NamesWithoutBoard = %v, want Delta", got)
+	}
+	if got, _ := cs.NamesWithSourceAndBoard(ctx, []string{"himalayas"}, atsProviders); len(got) != 0 {
+		t.Errorf("inactive board: NamesWithSourceAndBoard = %v, want none", got)
 	}
 }

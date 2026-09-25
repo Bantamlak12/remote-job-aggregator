@@ -131,9 +131,36 @@ func (c *Client) ListJobs(ctx context.Context, boardToken string) ([]ats.Job, er
 			LocationRaw: ats.CleanText(j.Location.Name),
 			Description: ats.HTMLToText(j.Content),
 			PublishedAt: parseTime(j.FirstPublished),
+			RemoteType:  workplaceFromLocation(j.Location.Name),
 		})
 	}
 	return jobs, nil
+}
+
+var (
+	hybridWord = regexp.MustCompile(`(?i)\bhybrid\b`)
+	// remoteWord matches "remote" as a word, except where it is negated or only
+	// a perk ("Non-remote", "Remote-friendly", "Remote-first HQ", "Not remote").
+	remoteWord = regexp.MustCompile(`(?i)\bremote\b`)
+	notRemote  = regexp.MustCompile(`(?i)(non[- ]?|not |no |semi[- ]|partially )remote|remote[- ](friendly|first|optional|eligible|possible)`)
+)
+
+// workplaceFromLocation reads the only workplace signal a Greenhouse posting
+// carries: its location text ("Remote - US", "Hybrid, London"). Hybrid wins
+// over remote ("Atlanta - Hybrid; Remote (US)" is a hybrid office role), a
+// negated or perk-only mention ("Non-remote", "Remote-friendly") says nothing,
+// and "" means the text says neither, so an office location is left
+// unclassified rather than guessed to be onsite.
+func workplaceFromLocation(location string) string {
+	switch {
+	case hybridWord.MatchString(location):
+		return "hybrid"
+	case notRemote.MatchString(location):
+		return ""
+	case remoteWord.MatchString(location):
+		return "remote"
+	}
+	return ""
 }
 
 // parseTime parses Greenhouse's RFC3339 timestamps (e.g.

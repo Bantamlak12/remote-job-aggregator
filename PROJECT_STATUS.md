@@ -794,8 +794,41 @@ remote companies on the main page. Migration `000004` adds `target_companies.mar
 `?market=` filter; the frontend has `/` (worldwide) and `/ethiopia` (header tabs), and the
 "Ethiopian tech companies only" toggle exists only on the Ethiopian page. Details:
 [docs/fresh-jobs.md](docs/fresh-jobs.md#markets-ethiopian-category-and-worldwide-main-page).
-Before the worldwide sources land, the worldwide list holds only the Greenhouse boards (GitLab,
-Figma, Airbnb, Discord); everything else is Ethiopian.
+The worldwide list started with only the Greenhouse boards (GitLab, Figma, Airbnb, Discord).
+
+### Worldwide remote job boards (branch `Bantamlak21/worldwide-remote-sources-e451cddd`)
+
+Six free remote-job boards feed the worldwide list: Himalayas, Remotive, Jobicy, We Work Remotely,
+Working Nomads, Remote OK (`internal/ats/remoteboards`, one collector each; details, terms and
+limits in [docs/remote-boards.md](docs/remote-boards.md)). First live run: 760 worldwide jobs from
+about 440 employers in 30 s, 500 of them Himalayas. Supporting changes: `ats.Job` /
+`job.Record` carry `RemoteType` and `EmploymentType` (a silent source never resets a stored
+value; migration not needed, the columns existed), the API reports each job's `source`, and the
+UI credits the board ("via Remotive", "Apply on Remotive") as their terms require.
+`HIMALAYAS_MAX_PAGES` (default 50) is new; `ingest --providers=remote-boards` runs them all.
+Rate terms are enforced, not left to discipline: each board has a minimum gap between runs kept
+in `collector_runs` (migration `000005`; Remotive 6 h, Himalayas 12 h, the rest 1 h; `--force`
+overrides). URLs off the board's own host, unreadable dates and all-records-unusable responses
+are refused; a Himalayas or Ethiojobs run cut short stores its jobs and still reports the failure
+(`ats.ErrPartialResult`); a renamed employer moves its job (`job.Store.MoveJob`).
+Known limit: most of these jobs are country-restricted (about 120 of 760 are open to
+"Worldwide"); eligibility filtering is Phase 4.
+
+### Remote-first companies' own boards (branch `Bantamlak21/remote-company-boards-e451cddd`)
+
+Lever and Ashby clients (`internal/ats/lever`, `internal/ats/ashby`; Greenhouse now reads remote /
+hybrid from the location text), and `aggregator discover-boards`, which finds a company's
+Greenhouse/Lever/Ashby board from its name and registers it only when the board proves it is the
+company's (`internal/discovery/guess.go`). `configs/remote_companies.txt` has 404 names (some as `Name | domain`);
+`--from-boards` looks up the employers the remote job boards showed; `--recheck --apply`
+re-looks-up registered boards and deactivates only one that `discover-boards` registered and that
+names itself as another company's. The first live run registered 6 boards of other companies (3.4%),
+so the identity rules were rebuilt around positive proof (domain, exact Greenhouse name, whole-word
+name in half the sampled jobs, everyday-word names refused without a domain, ambiguity refused) and
+measured on 15 real boards (100% precision); an employer a job board showed must also list one of
+its job titles. Live: 213 companies with an active board, and a worldwide list of 15,960 open jobs
+from 819 companies (5,263 classified remote). Details,
+limits and the measured numbers: [docs/company-boards.md](docs/company-boards.md).
 
 ## 3. Work In Progress
 

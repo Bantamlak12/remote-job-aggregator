@@ -1,0 +1,417 @@
+# Remote-first and remote-friendly companies, by name. `aggregator discover-boards`
+# looks each one up on Greenhouse, Lever and Ashby (a name is enough: the boards
+# are addressed by a slug that is nearly always the company's name) and
+# registers the boards that prove they are the company's. A name with no public
+# board there is simply not found; adding a name costs a handful of requests.
+# One name per line; blank lines and lines starting with # are ignored.
+#
+# "Name | domain.tld" adds the company's web domain: the board is then accepted
+# only if its job text mentions that domain, which is the only proof that works
+# for a name that is also an everyday word (Close, Linear, Ramp). A name made of
+# everyday words with no domain is not looked up at all, and a name that shows
+# up on more than one board is refused as ambiguous; both are logged so the
+# domain can be added. The domains below were each checked against a live board.
+GitLab
+Automattic
+Zapier | zapier.com
+Doist
+Buffer | buffer.com
+Toptal
+Deel
+Remote
+Oyster
+Hotjar
+Elastic
+Canonical
+Mozilla
+Sourcegraph
+Vercel
+Netlify
+Cloudflare
+HashiCorp
+Grafana Labs
+PostHog
+Supabase | supabase.com
+Sentry | sentry.io
+Ghost
+Basecamp
+Articulate
+Close | close.com
+DuckDuckGo
+Ahrefs
+Wikimedia Foundation
+InVision
+Kraken
+Coinbase
+Fivetran
+dbt Labs
+Airbyte
+Mattermost
+Prefect
+Docker
+Datadog
+Twilio
+Stripe
+Figma
+Notion | notion.so
+Linear | linear.app
+Ramp | ramp.com
+Mercury
+Retool
+Airtable
+Loom
+Miro
+Canva
+Webflow
+Squarespace
+Shopify
+Gumroad
+Calendly
+Typeform
+Intercom | intercom.com
+Front
+Help Scout
+Zendesk
+HubSpot
+Mailchimp
+Customer.io
+Segment
+Amplitude
+Mixpanel
+Heap
+LaunchDarkly
+Split
+Optimizely
+PagerDuty
+Honeycomb
+Chronosphere
+New Relic
+Snyk
+1Password
+Bitwarden
+Tailscale
+Cockroach Labs
+PlanetScale
+Neon
+Timescale
+MongoDB
+Redis
+Confluent
+Materialize
+Databricks
+Snowflake
+Anyscale
+Hugging Face
+Weights & Biases
+Scale AI
+OpenAI
+Anthropic
+Cohere
+Mistral AI
+Replit | replit.com
+Glitch
+Fly.io
+Render | render.com
+Railway | railway.com
+DigitalOcean
+Linode
+Vultr
+Backblaze
+Fastly
+Akamai
+Postman
+Kong
+Apollo GraphQL
+Hasura
+Prisma
+Temporal
+Pulumi
+Terraform
+Gruntwork
+Mux | mux.com
+Cloudinary
+Imgix
+Contentful
+Sanity | sanity.io
+Storyblok
+Strapi
+Algolia
+Meilisearch
+Typesense
+Gitpod
+CircleCI
+Buildkite
+Harness
+JFrog
+Sonatype
+GitHub
+Bitbucket
+Atlassian
+JetBrains
+Tabnine
+Codecov
+Rollbar
+LogRocket
+FullStory
+Pendo
+WalkMe
+Whereby
+Around
+Krisp
+Descript
+Riverside
+Zencastr
+Podia
+Teachable
+Thinkific | thinkific.com
+Kajabi
+Patreon
+Substack
+Medium | medium.com
+Beehiiv
+ConvertKit
+Kit | kit.com
+Lemon Squeezy
+Paddle
+FastSpring
+Chargebee
+Recurly
+Wise
+Revolut
+Monzo
+Chime | chime.com
+Plaid
+Brex
+Gusto
+Rippling
+Remote.com
+Papaya Global
+Velocity Global
+Multiplier
+Omnipresent
+Remofirst
+Lano
+Hibob
+Personio
+Culture Amp
+Lattice
+15Five
+Leapsome
+Workleap
+Greenhouse
+Lever
+Ashby
+Gem
+SeekOut
+Hired
+Wellfound
+Andela
+Turing
+Crossover
+Working Solutions
+Upwork
+Fiverr
+Freelancer
+Braintrust
+Gun.io
+Arc
+Torre
+Terminal | withterminal.com
+Bitovi
+Thoughtbot
+Ministry of Programming
+Ten Thousand Coffees
+Aha
+Asana
+Trello
+Monday.com
+ClickUp
+Coda
+Slite
+Almanac
+Tettra
+Guru
+Slack
+Discord
+Twist
+Zoom
+Element
+Matrix
+Signal
+Proton
+Tutanota
+Mullvad
+Nord Security | nordsec.com
+Surfshark
+ExpressVPN
+WP Engine
+Kinsta
+Pantheon | pantheon.io
+Acquia
+Drupal
+Yoast
+Awesome Motive
+Liquid Web
+Jetpack
+WooCommerce
+Human Made
+10up
+XWP
+Sucuri
+Wordfence
+Gravity Forms
+Elementor
+Beaver Builder
+Delicious Brains
+Iterable
+Braze
+OneSignal
+Klaviyo
+Attentive
+Postscript
+Yotpo
+Gorgias
+Recharge
+Bold Commerce
+Shogun
+Nosto
+Bloomreach
+Lucidworks
+Coveo
+Sitecore
+Contentstack
+Prismic
+Tinybird
+ClickHouse
+Starburst
+Dremio
+Preset
+Metabase
+Lightdash
+Hex | hex.tech
+Observable
+Deepnote
+Mode
+Looker
+Sigma Computing
+Census
+Hightouch
+RudderStack
+mParticle
+Snowplow
+Statsig
+GrowthBook
+Unleash
+Flagsmith
+Doppler | doppler.com
+Infisical
+Vault
+Teleport
+Boundary
+Okta
+Auth0
+Clerk | clerk.com
+Stytch
+WorkOS
+FusionAuth
+Ory
+Keycloak
+Aiven
+Ably
+Appwrite
+Attio
+Axiom
+Bitrise
+BrowserStack
+Bubble | bubble.io
+Calm
+CARTO
+Chainguard
+Checkly
+CodeSandbox
+Codeium
+Cursor
+Dagster
+Daily
+Dashlane
+DataStax
+Directus
+Dovetail
+Drata
+Dropbox
+Duolingo
+Embrace
+Expo
+Fauna
+Fireworks AI
+Flatfile
+Formstack
+Frontend Masters
+Frontegg
+Gitea
+GitKraken
+Grafbase
+Groq
+Harvest
+Heroku
+Honeybadger
+Hopin
+Hyperbeam
+Incident.io
+Indeed
+Jam
+Jellyfish
+Kandji
+Knock
+Lightspeed
+LiveKit
+Loops
+Mailgun
+Mapbox
+Modal | modal.com
+Modern Treasury
+Mysten Labs
+n8n
+Nango
+Netdata
+Nomad
+Nuxt
+Ockam
+OpenSea
+Orb
+Outschool | outschool.com
+Oxide
+Pipedrive
+Pitch
+Polar
+Qovery
+Quickbase
+Raycast
+Readme | readme.com
+Redpanda
+Resend | resend.com
+Rive
+Scaleway
+Semaphore
+Sendgrid
+Shipbob
+Speakeasy
+Stainless
+Sumo Logic
+Svix
+Tailwind Labs
+Tandem
+Trigger.dev
+Turso
+Unkey
+Upstash
+Vanta
+Vimeo
+Warp | warp.dev
+Wasmer
+Whimsical
+Xata
+Yugabyte | yugabyte.com
+Zed Industries
+Zeplin
+Zuora

@@ -94,6 +94,14 @@ type JobUpserter interface {
 	MarkMissingAsRemoved(ctx context.Context, targetCompanyID int64, seenSourceJobIDs []string) (int, error)
 	CloseStale(ctx context.Context, targetCompanyID int64, olderThan time.Duration) (int, error)
 	CloseBySourceID(ctx context.Context, targetCompanyID int64, sourceJobIDs []string) (int, error)
+	// MoveJob re-homes an existing job (identified by source and source id) to
+	// another target and company. Only many-employer collectors use it: there
+	// a job's identity is the board's own id, and an employer renamed on the
+	// board must not strand the job under the old spelling.
+	MoveJob(ctx context.Context, source, sourceJobID string, targetCompanyID, companyID int64) error
+	// OpenOpenings lists a company's open jobs in one market from sources
+	// other than excludeSource, for cross-run duplicate detection.
+	OpenOpenings(ctx context.Context, companyID int64, mk, excludeSource string) ([]job.Opening, error)
 }
 
 // Result is the outcome of ingesting one target. Err is nil if and only
@@ -134,6 +142,8 @@ type Ingester struct {
 	logger         *slog.Logger
 	now            func() time.Time
 	collectors     CollectorConfig
+	// forceCollectors ignores IntervalCollector limits (see WithForce).
+	forceCollectors bool
 }
 
 // maxFuturePublishedAt is how far ahead of now a publish date may be
@@ -244,7 +254,7 @@ func (in *Ingester) processTarget(ctx context.Context, t company.TargetCompany) 
 	if pc, ok := client.(PartialClient); ok {
 		staleAfter = pc.StaleAfter()
 	}
-	return in.persist(ctx, t, atsJobs, staleAfter)
+	return in.persist(ctx, t, atsJobs, staleAfter, false)
 }
 
 // persist stores what a source returned for target t and closes what the
@@ -255,7 +265,7 @@ func (in *Ingester) processTarget(ctx context.Context, t company.TargetCompany) 
 // staleAfter > 0 marks the listing as a sample (see PartialClient): jobs
 // missing from it are not closed, only those unseen for staleAfter.
 // staleAfter <= 0 is a full board: anything missing is closed.
-func (in *Ingester) persist(ctx context.Context, t company.TargetCompany, atsJobs []ats.Job, staleAfter time.Duration) Result {
+func (in *Ingester) persist(ctx context.Context, t company.TargetCompany, atsJobs []ats.Job, staleAfter time.Duration, movable bool) Result {
 	var err error
 	seenIDs := make([]string, 0, len(atsJobs))
 	var endedIDs []string
@@ -297,7 +307,7 @@ func (in *Ingester) persist(ctx context.Context, t company.TargetCompany, atsJob
 			continue
 		}
 
-		outcome, err := in.jobs.UpsertFromATS(ctx, job.Record{
+		rec := job.Record{
 			CompanyID: t.CompanyID, TargetCompanyID: t.ID,
 			Source: t.ATSProvider, SourceJobID: aj.ExternalID,
 			// CanonicalURL is deliberately left empty: (source, source_job_id)
@@ -306,7 +316,19 @@ func (in *Ingester) persist(ctx context.Context, t company.TargetCompany, atsJob
 			// duplicated URL abort a whole board's ingestion forever.
 			Title: aj.Title, Description: aj.Description,
 			ApplicationURL: aj.URL, LocationRaw: aj.LocationRaw, PublishedAt: aj.PublishedAt, ExpiresAt: aj.ExpiresAt,
-		})
+			RemoteType: aj.RemoteType, EmploymentType: aj.EmploymentType,
+		}
+		outcome, err := in.jobs.UpsertFromATS(ctx, rec)
+		if err != nil && movable && errors.Is(err, job.ErrJobTargetMismatch) {
+			// The board's id is the identity, and the employer's name changed
+			// (or was spelled another way): the row belongs under this target now.
+			if mvErr := in.jobs.MoveJob(ctx, t.ATSProvider, aj.ExternalID, t.ID, t.CompanyID); mvErr == nil {
+				outcome, err = in.jobs.UpsertFromATS(ctx, rec)
+			} else {
+				in.logger.Warn("ingestion: moving a job to its renamed employer failed",
+					"target_id", t.ID, "external_id", aj.ExternalID, "error", mvErr)
+			}
+		}
 		if err != nil {
 			// A job the database refused (bad data) is skipped and logged;
 			// one bad job must never freeze its whole board's ingestion.
