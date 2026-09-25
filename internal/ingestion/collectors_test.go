@@ -3,11 +3,14 @@ package ingestion
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Bantamlak12/remote-job-aggregator/internal/ats"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/company"
@@ -428,13 +431,13 @@ func TestRunCollectors_TheSameTitleInAnotherCityIsAnotherOpening(t *testing.T) {
 		j.LocationRaw = place
 		return j
 	}
-	first := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("e1", "Addis Ababa")}}
-	second := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{
+	first := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("e1", "Addis Ababa")}}, market.Ethiopia}
+	second := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{
 		at("l1", "Hawassa, Ethiopia"),        // another city: kept
 		at("l2", "Ethiopia"),                 // no city, Ethiopian: the same opening as e1
 		at("l3", "Addis Ababa, Addis Ababa"), // same city, other spelling: duplicate
 		at("l4", "Nairobi, Kenya"),           // another country: kept
-	}}
+	}}, market.Ethiopia}
 	jobs := &fakeJobUpserter{}
 	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"ethiojobs": first, "linkedin": second})
 
@@ -454,7 +457,7 @@ func TestRunCollectors_AnOpeningThatFailedToStoreDoesNotSuppressTheNextCollector
 	second := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("l1", "Accountant", "Acme")}}
 	jobs := &fakeJobUpserter{outcomeFn: func(r job.Record) (job.UpsertOutcome, error) {
 		if r.SourceJobID == "e1" {
-			return job.UpsertOutcome{}, job.ErrJobTargetMismatch
+			return job.UpsertOutcome{}, &pgconn.PgError{Code: "23514"} // a check-constraint violation: the database refused this record
 		}
 		return job.UpsertOutcome{Inserted: true, Changed: true}, nil
 	}}
@@ -496,5 +499,407 @@ func TestRunCollectors_TargetsAreRegisteredInTheCollectorsMarket(t *testing.T) {
 	}
 	if !slices.Equal(reg.calls, want) {
 		t.Errorf("registrar calls = %+v, want %+v", reg.calls, want)
+	}
+}
+
+// What a source says about remote and employment type reaches the stored record.
+func TestRunCollectors_PassesRemoteAndEmploymentTypeToTheRecord(t *testing.T) {
+	j := mkJob("r1", "Engineer", "Acme")
+	j.RemoteType, j.EmploymentType = "remote", "contract"
+	col := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{j, mkJob("r2", "Cook", "Acme")}}
+	jobs := &fakeJobUpserter{}
+	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"remotive": col})
+
+	if _, err := in.RunCollectors(context.Background(), []string{"remotive"}); err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	got := map[string][2]string{}
+	for _, u := range jobs.upserts {
+		got[u.SourceJobID] = [2]string{u.RemoteType, u.EmploymentType}
+	}
+	if got["r1"] != [2]string{"remote", "contract"} || got["r2"] != [2]string{"", ""} {
+		t.Errorf("records = %v, want r1 remote/contract and r2 silent", got)
+	}
+}
+
+// ---- partial results ----
+
+func TestRunCollectors_APartialResultIsStoredAndStillReported(t *testing.T) {
+	col := &fakeCollector{staleAfter: time.Hour,
+		jobs: []ats.Job{mkJob("a", "Cook", "Acme")},
+		err:  fmt.Errorf("stopped at page 3: %w", ats.ErrPartialResult)}
+	jobs := &fakeJobUpserter{}
+	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"himalayas": col})
+
+	results, err := in.RunCollectors(context.Background(), []string{"himalayas"})
+	if err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	if got := storedIDs(jobs); !slices.Equal(got, []string{"a"}) {
+		t.Errorf("stored = %v, want the jobs collected before the failure", got)
+	}
+	var failures, stored int
+	for _, r := range results {
+		if r.Err != nil {
+			failures++
+			if !errors.Is(r.Err, ats.ErrPartialResult) {
+				t.Errorf("failure %v does not wrap ErrPartialResult", r.Err)
+			}
+		} else {
+			stored += r.Inserted
+		}
+	}
+	if failures != 1 || stored != 1 {
+		t.Errorf("failures = %d, inserted = %d; want the failure reported and the job stored", failures, stored)
+	}
+
+	// A plain error with jobs (not marked partial) still drops everything.
+	plain := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("b", "Cook", "Acme")}, err: errors.New("boom")}
+	jobs2 := &fakeJobUpserter{}
+	in2, _ := newCollectorIngester(jobs2, newFakeRegistrar(), nil, nil, map[string]Collector{"x": plain})
+	if _, err := in2.RunCollectors(context.Background(), []string{"x"}); err != nil || len(jobs2.upserts) != 0 {
+		t.Errorf("a plain error stored %d jobs (err %v); want none", len(jobs2.upserts), err)
+	}
+}
+
+// ---- rate limits ----
+
+type fakeRunLog struct {
+	mu      sync.Mutex
+	last    map[string]time.Time
+	readErr error
+	records []string
+}
+
+func (f *fakeRunLog) LastRun(_ context.Context, name string) (time.Time, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return time.Time{}, false, f.readErr
+	}
+	at, ok := f.last[name]
+	return at, ok, nil
+}
+
+func (f *fakeRunLog) RecordRun(_ context.Context, name string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.last == nil {
+		f.last = map[string]time.Time{}
+	}
+	f.last[name] = at
+	f.records = append(f.records, name)
+	return nil
+}
+
+type intervalCollector struct {
+	*fakeCollector
+	every time.Duration
+}
+
+func (c intervalCollector) MinInterval() time.Duration { return c.every }
+
+func TestRunCollectors_ARateLimitedCollectorIsSkippedUntilItsIntervalPasses(t *testing.T) {
+	col := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("a", "Cook", "Acme")}}
+	limited := intervalCollector{col, 6 * time.Hour}
+	log := &fakeRunLog{}
+	in, _ := newCollectorIngester(&fakeJobUpserter{}, newFakeRegistrar(), nil, nil, map[string]Collector{"remotive": limited})
+	cfg := in.collectors
+	cfg.RunLog = log
+	in.WithCollectors(cfg)
+
+	now := time.Date(2026, 9, 25, 6, 0, 0, 0, time.UTC)
+	in.now = func() time.Time { return now }
+	run := func() {
+		t.Helper()
+		if _, err := in.RunCollectors(context.Background(), []string{"remotive"}); err != nil {
+			t.Fatalf("RunCollectors() error = %v", err)
+		}
+	}
+
+	run() // never ran: goes
+	if col.calls != 1 {
+		t.Fatalf("first run: %d calls, want 1", col.calls)
+	}
+	now = now.Add(5 * time.Hour)
+	run() // 5h later, limit 6h: skipped
+	if col.calls != 1 {
+		t.Errorf("a run 5h after the last (limit 6h) called the collector again: %d calls", col.calls)
+	}
+	in.WithForce(true)
+	run() // forced: goes
+	if col.calls != 2 {
+		t.Errorf("a forced run did not call the collector: %d calls", col.calls)
+	}
+	in.WithForce(false)
+	now = now.Add(5*time.Hour + time.Minute) // 5h1m after the forced run: still too soon
+	run()
+	if col.calls != 2 {
+		t.Errorf("the forced run was not recorded: %d calls", col.calls)
+	}
+	now = now.Add(2 * time.Hour)
+	run() // past the interval: goes
+	if col.calls != 3 {
+		t.Errorf("a run after the interval did not call the collector: %d calls", col.calls)
+	}
+}
+
+func TestRunCollectors_IfTheLastRunCannotBeReadARateLimitedCollectorIsNotCalled(t *testing.T) {
+	col := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("a", "Cook", "Acme")}}
+	in, _ := newCollectorIngester(&fakeJobUpserter{}, newFakeRegistrar(), nil, nil, map[string]Collector{"remotive": intervalCollector{col, time.Hour}})
+	cfg := in.collectors
+	cfg.RunLog = &fakeRunLog{readErr: errors.New("db down")}
+	in.WithCollectors(cfg)
+	results, err := in.RunCollectors(context.Background(), []string{"remotive"})
+	if err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	if col.calls != 0 {
+		t.Errorf("collector called %d times although its rate limit could not be checked", col.calls)
+	}
+	// Not a quiet skip: an unreadable run log (a missing migration, a database
+	// problem) is a failure the operator must see in the results.
+	if len(results) != 1 || results[0].Err == nil || !strings.Contains(results[0].Err.Error(), "run log") {
+		t.Errorf("results = %+v, want one failed result naming the run log", results)
+	}
+}
+
+// A scheduled run lands a little earlier than the minimum gap after the last
+// one; within the tolerance it still goes ahead.
+func TestRunCollectors_AScheduledRunJustInsideTheGapStillGoesAhead(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		ago      time.Duration
+		wantCall bool
+	}{
+		{"exactly the gap", 6 * time.Hour, true},
+		{"5 minutes short", 6*time.Hour - 5*time.Minute, true},
+		{"just inside the tolerance", 6*time.Hour - intervalTolerance, true},
+		{"11 minutes short", 6*time.Hour - 11*time.Minute, false},
+		{"an hour ago", time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			col := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("a", "Cook", "Acme")}}
+			in, _ := newCollectorIngester(&fakeJobUpserter{}, newFakeRegistrar(), nil, nil, map[string]Collector{"remotive": intervalCollector{col, 6 * time.Hour}})
+			now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+			in.now = func() time.Time { return now }
+			cfg := in.collectors
+			cfg.RunLog = &fakeRunLog{last: map[string]time.Time{"remotive": now.Add(-tc.ago)}}
+			in.WithCollectors(cfg)
+			if _, err := in.RunCollectors(context.Background(), []string{"remotive"}); err != nil {
+				t.Fatal(err)
+			}
+			if (col.calls == 1) != tc.wantCall {
+				t.Errorf("calls = %d, want called = %t", col.calls, tc.wantCall)
+			}
+		})
+	}
+}
+
+// ---- duplicates across runs ----
+
+func TestRunCollectors_AnOpeningAnotherSourceAlreadyStoresIsSkippedAcrossRuns(t *testing.T) {
+	// The store says Himalayas already holds "Backend Engineer" for this company
+	// in the worldwide market (stored by an earlier invocation).
+	jobs := &fakeJobUpserter{openings: []job.Opening{{Title: "Backend  Engineer!", Location: "United States"}}}
+	col := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{
+		mkJob("j1", "backend engineer", "Acme"), // the same opening under another source: skipped
+		mkJob("j2", "Data Analyst", "Acme"),     // a different opening: stored
+	}}, market.Worldwide}
+	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"jobicy": col})
+	if _, err := in.RunCollectors(context.Background(), []string{"jobicy"}); err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	if got := storedIDs(jobs); !slices.Equal(got, []string{"j2"}) {
+		t.Errorf("stored = %v, want only j2", got)
+	}
+	if len(jobs.openingCalls) != 1 || jobs.openingCalls[0].market != "worldwide" || jobs.openingCalls[0].avoid != "jobicy" {
+		t.Errorf("OpenOpenings calls = %+v, want one for the worldwide market excluding the collector's own source", jobs.openingCalls)
+	}
+}
+
+// In the Ethiopian market the place still matters.
+func TestRunCollectors_AnEthiopianOpeningInAnotherCityIsNotADuplicateOfAnotherSourcesCopy(t *testing.T) {
+	jobs := &fakeJobUpserter{openings: []job.Opening{{Title: "Cashier", Location: "Addis Ababa"}}}
+	at := func(id, place string) ats.Job {
+		j := mkJob(id, "Cashier", "Bank")
+		j.LocationRaw = place
+		return j
+	}
+	col := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("a", "Addis Ababa, Ethiopia"), at("h", "Hawassa")}}, market.Ethiopia}
+	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"ethiojobs": col})
+	if _, err := in.RunCollectors(context.Background(), []string{"ethiojobs"}); err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	if got := storedIDs(jobs); !slices.Equal(got, []string{"h"}) {
+		t.Errorf("stored = %v, want only the Hawassa opening (the Addis one duplicates the other source's copy)", got)
+	}
+}
+
+func TestRunCollectors_IfTheDuplicateCheckFailsTheJobsAreStillStored(t *testing.T) {
+	jobs := &fakeJobUpserter{openingsErr: errors.New("db hiccup")}
+	col := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("j1", "Cook", "Acme")}}
+	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"x": col})
+	if _, err := in.RunCollectors(context.Background(), []string{"x"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedIDs(jobs); !slices.Equal(got, []string{"j1"}) {
+		t.Errorf("stored = %v, want j1 (a failed duplicate check must not lose jobs)", got)
+	}
+}
+
+// The same title and place at one employer in two markets are two jobs in two
+// lists: an Ethiopian listing must never suppress a worldwide one (or the
+// reverse) in the same run.
+func TestRunCollectors_OpeningsAreNeverComparedAcrossMarkets(t *testing.T) {
+	at := func(id string) ats.Job {
+		j := mkJob(id, "Backend Engineer", "Acme")
+		j.LocationRaw = "Addis Ababa"
+		return j
+	}
+	world := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("w1")}}, market.Worldwide}
+	local := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("l1")}}, market.Ethiopia}
+	jobs := &fakeJobUpserter{}
+	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"remotive": world, "ethiojobs": local})
+	if _, err := in.RunCollectors(context.Background(), []string{"remotive", "ethiojobs"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedIDs(jobs); !slices.Equal(got, []string{"l1", "w1"}) {
+		t.Errorf("stored = %v, want both (different markets)", got)
+	}
+}
+
+func TestRunCollectors_CollectorsWithoutALimitAreNeverSkipped(t *testing.T) {
+	col := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("a", "Cook", "Acme")}}
+	log := &fakeRunLog{}
+	in, _ := newCollectorIngester(&fakeJobUpserter{}, newFakeRegistrar(), nil, nil, map[string]Collector{"ethiojobs": col})
+	cfg := in.collectors
+	cfg.RunLog = log
+	in.WithCollectors(cfg)
+	for i := 0; i < 3; i++ {
+		if _, err := in.RunCollectors(context.Background(), []string{"ethiojobs"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if col.calls != 3 || len(log.records) != 0 {
+		t.Errorf("calls = %d, recorded = %v; want 3 calls and no run log entries for an unlimited collector", col.calls, log.records)
+	}
+}
+
+// ---- renamed employers ----
+
+func TestRunCollectors_ARenamedEmployerMovesItsJobInsteadOfStrandingIt(t *testing.T) {
+	col := &fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("77", "Cook", "New Name")}}
+	moved := false
+	jobs := &fakeJobUpserter{}
+	jobs.outcomeFn = func(r job.Record) (job.UpsertOutcome, error) {
+		if !moved {
+			return job.UpsertOutcome{}, job.ErrJobTargetMismatch // the row sits under the old employer's target
+		}
+		return job.UpsertOutcome{Changed: true}, nil
+	}
+	wrapped := &movingUpserter{fakeJobUpserter: jobs, onMove: func() { moved = true }}
+	in := New(&fakeTargetLister{}, &fakeTargetRecorder{}, wrapped, map[string]ATSClient{}, 1, testLogger())
+	reg := newFakeRegistrar()
+	in.WithCollectors(CollectorConfig{Collectors: map[string]Collector{"remotive": col}, Registrar: reg})
+
+	results, err := in.RunCollectors(context.Background(), []string{"remotive"})
+	if err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	if len(jobs.moves) != 1 || jobs.moves[0].source != "remotive" || jobs.moves[0].id != "77" {
+		t.Fatalf("moves = %+v, want one move of remotive/77", jobs.moves)
+	}
+	tgt := reg.targets["remotive/new name"]
+	if jobs.moves[0].targetID != tgt.ID || jobs.moves[0].companyID != tgt.CompanyID {
+		t.Errorf("moved to target %d company %d, want %d/%d", jobs.moves[0].targetID, jobs.moves[0].companyID, tgt.ID, tgt.CompanyID)
+	}
+	var skipped, changed int
+	for _, r := range results {
+		skipped += r.Skipped
+		changed += r.Changed
+	}
+	if skipped != 0 || changed != 1 {
+		t.Errorf("skipped %d, changed %d; want the job stored after the move", skipped, changed)
+	}
+}
+
+// movingUpserter flips a flag when the fake is asked to move a job.
+type movingUpserter struct {
+	*fakeJobUpserter
+	onMove func()
+}
+
+func (m *movingUpserter) MoveJob(ctx context.Context, source, id string, targetID, companyID int64) error {
+	m.onMove()
+	return m.fakeJobUpserter.MoveJob(ctx, source, id, targetID, companyID)
+}
+
+// A per-company board must never re-home a job: a mismatch there is a bug.
+func TestRun_APerCompanyBoardNeverMovesAJob(t *testing.T) {
+	target := testTarget(1, 10, "greenhouse", "acme")
+	atsClient := &fakeATSClient{jobs: map[string][]ats.Job{"acme": {{ExternalID: "1", Title: "A", URL: "https://x.test/1"}}}}
+	jobs := &fakeJobUpserter{outcomeFn: func(job.Record) (job.UpsertOutcome, error) { return job.UpsertOutcome{}, job.ErrJobTargetMismatch }}
+	in := New(&fakeTargetLister{targets: []company.TargetCompany{target}}, &fakeTargetRecorder{}, jobs,
+		map[string]ATSClient{"greenhouse": atsClient}, 1, testLogger())
+	results, err := in.Run(context.Background())
+	if err != nil || len(results) != 1 || results[0].Skipped != 1 || len(jobs.moves) != 0 {
+		t.Errorf("results = %+v, moves = %v, err = %v; want the job skipped and never moved", results, jobs.moves, err)
+	}
+}
+
+// ---- worldwide resolution and dedupe ----
+
+func TestRunCollectors_WorldwideSourcesOnlyResolveCompaniesThatHireOutsideEthiopia(t *testing.T) {
+	ethiopian := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{mkJob("e1", "Cook", "ethswitch s.c.")}}, market.Ethiopia}
+	global := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{
+		mkJob("g1", "Cook", "ethswitch s.c."),       // a same-named company on a worldwide board: not the Ethiopian one
+		mkJob("g2", "Cook", "gebeya developer inc"), // an Ethiopian company that hires worldwide
+	}}, market.Worldwide}
+	reg := newFakeRegistrar()
+	in := New(&fakeTargetLister{}, &fakeTargetRecorder{}, &fakeJobUpserter{}, map[string]ATSClient{}, 1, testLogger())
+	in.WithCollectors(CollectorConfig{
+		Collectors: map[string]Collector{"ethiojobs": ethiopian, "remotive": global},
+		Registrar:  reg,
+		Resolver: fakeResolver{
+			"ethswitch s.c.":       {canonical: "EthSwitch", priority: true},
+			"gebeya developer inc": {canonical: "Gebeya", priority: true},
+		},
+		WorldwideResolver: fakeResolver{"gebeya developer inc": {canonical: "Gebeya", priority: true}},
+	})
+	if _, err := in.RunCollectors(context.Background(), []string{"ethiojobs", "remotive"}); err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	got := map[string]registrarCall{}
+	for _, c := range reg.calls {
+		got[c.provider+"/"+c.employer] = c
+	}
+	if c := got["ethiojobs/EthSwitch"]; !c.priority {
+		t.Errorf("the Ethiopian source did not resolve EthSwitch: %+v", got)
+	}
+	if c, ok := got["remotive/ethswitch s.c."]; !ok || c.priority {
+		t.Errorf("the worldwide source treated a same-named company as the Ethiopian priority one: %+v", got)
+	}
+	if c := got["remotive/Gebeya"]; !c.priority {
+		t.Errorf("the worldwide source did not resolve Gebeya, which hires outside Ethiopia: %+v", got)
+	}
+}
+
+func TestRunCollectors_WorldwideOpeningsAreDedupedWhateverTheRegionWording_ButNotAcrossMarkets(t *testing.T) {
+	at := func(id, place string) ats.Job {
+		j := mkJob(id, "Backend Engineer", "Acme")
+		j.LocationRaw = place
+		return j
+	}
+	boardA := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("a1", "USA")}}, market.Worldwide}
+	boardB := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("b1", "United States"), at("b2", "Worldwide")}}, market.Worldwide}
+	local := marketCollector{&fakeCollector{staleAfter: time.Hour, jobs: []ats.Job{at("l1", "Addis Ababa")}}, market.Ethiopia}
+	jobs := &fakeJobUpserter{}
+	in, _ := newCollectorIngester(jobs, newFakeRegistrar(), nil, nil, map[string]Collector{"a": boardA, "b": boardB, "local": local})
+	if _, err := in.RunCollectors(context.Background(), []string{"a", "b", "local"}); err != nil {
+		t.Fatalf("RunCollectors() error = %v", err)
+	}
+	if got := storedIDs(jobs); !slices.Equal(got, []string{"a1", "l1"}) {
+		t.Errorf("stored = %v, want a1 (b1 and b2 are the same worldwide opening as a1 whatever the region says) and l1 (another market)", got)
 	}
 }

@@ -33,6 +33,11 @@ type Record struct {
 	LocationRaw     string
 	PublishedAt     time.Time // zero means unknown
 	ExpiresAt       time.Time // application deadline; zero means none known
+	// RemoteType and EmploymentType are what the source says ("" = the source
+	// does not say: a new row is "unknown", an existing value is kept, so a
+	// later classification is never reset by a source that stays silent).
+	RemoteType     string
+	EmploymentType string
 }
 
 // UpsertOutcome reports what UpsertFromATS actually did, for ingestion's
@@ -113,6 +118,16 @@ func contentHash(r Record) string {
 		h.Write([]byte(field))
 		h.Write([]byte{0})
 	}
+	// What the source says about remote and employment type counts as content
+	// only when it says something, so a job stored before these fields existed
+	// (and a source that never fills them) keeps its hash and is not reported
+	// as changed on the next run.
+	for _, field := range []string{r.RemoteType, r.EmploymentType} {
+		if field != "" {
+			h.Write([]byte(field))
+			h.Write([]byte{0})
+		}
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -141,8 +156,10 @@ const upsertJobQuery = `
 	)
 	INSERT INTO jobs (
 		company_id, target_company_id, source, source_job_id, canonical_url,
-		title, description, application_url, location_raw, published_at, content_hash, expires_at
-	) VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, NULLIF($9, ''), $10, $11, $12)
+		title, description, application_url, location_raw, published_at, content_hash, expires_at,
+		remote_type, employment_type
+	) VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, NULLIF($9, ''), $10, $11, $12,
+		COALESCE(NULLIF($13, ''), 'unknown'), COALESCE(NULLIF($14, ''), 'unknown'))
 	ON CONFLICT (source, source_job_id) DO UPDATE SET
 		title              = EXCLUDED.title,
 		description        = EXCLUDED.description,
@@ -151,6 +168,8 @@ const upsertJobQuery = `
 		canonical_url      = EXCLUDED.canonical_url,
 		published_at       = COALESCE(EXCLUDED.published_at, jobs.published_at),
 		expires_at         = COALESCE(EXCLUDED.expires_at, jobs.expires_at),
+		remote_type        = COALESCE(NULLIF($13, ''), jobs.remote_type),
+		employment_type    = COALESCE(NULLIF($14, ''), jobs.employment_type),
 		content_hash       = EXCLUDED.content_hash,
 		last_seen_at       = now(),
 		last_changed_at    = CASE WHEN jobs.content_hash IS DISTINCT FROM EXCLUDED.content_hash OR jobs.status <> 'open'
@@ -198,6 +217,7 @@ func (s *Store) UpsertFromATS(ctx context.Context, r Record) (UpsertOutcome, err
 	err := s.pool.QueryRow(ctx, upsertJobQuery,
 		r.CompanyID, r.TargetCompanyID, source, sourceJobID, strings.TrimSpace(r.CanonicalURL),
 		r.Title, r.Description, r.ApplicationURL, strings.TrimSpace(r.LocationRaw), publishedAt, newHash, expiresAt,
+		strings.TrimSpace(r.RemoteType), strings.TrimSpace(r.EmploymentType),
 	).Scan(&id, &inserted, &previousContentHash, &previousStatus)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -327,12 +347,64 @@ func (s *Store) CloseBySourceID(ctx context.Context, targetCompanyID int64, sour
 	return int(tag.RowsAffected()), nil
 }
 
+// Opening is the identity of one open job as far as duplicate detection goes.
+type Opening struct {
+	Title    string
+	Location string
+}
+
+const openOpeningsQuery = `SELECT j.title, COALESCE(j.location_raw, '')
+	FROM jobs j JOIN target_companies t ON t.id = j.target_company_id
+	WHERE j.company_id = $1 AND t.market = $2 AND j.status = 'open' AND j.source <> $3`
+
+// OpenOpenings lists the open jobs of a company in one market that came from
+// a source other than excludeSource. Collectors use it to skip an opening
+// another source already stores, across separate runs (the in-run check only
+// sees one invocation, and rate-limited boards run in different ones).
+func (s *Store) OpenOpenings(ctx context.Context, companyID int64, mk, excludeSource string) ([]Opening, error) {
+	rows, err := s.pool.Query(ctx, openOpeningsQuery, companyID, mk, excludeSource)
+	if err != nil {
+		return nil, fmt.Errorf("job: listing open openings of company %d: %w", companyID, err)
+	}
+	defer rows.Close()
+	var out []Opening
+	for rows.Next() {
+		var o Opening
+		if err := rows.Scan(&o.Title, &o.Location); err != nil {
+			return nil, fmt.Errorf("job: scanning an opening: %w", err)
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+const moveJobQuery = `UPDATE jobs SET target_company_id = $3, company_id = $4
+	WHERE source = $1 AND source_job_id = $2`
+
+// MoveJob re-homes the job (source, sourceJobID) under another target and
+// company. The composite foreign keys still apply: the target must belong to
+// the company and carry the same provider as the job's source, so a move can
+// never attach a job to a company that does not own its target. It exists for
+// multi-employer sources, where the board's own id is a job's identity and an
+// employer renamed on the board must not strand the job under the old name.
+// It returns ErrNotFound when no such job exists.
+func (s *Store) MoveJob(ctx context.Context, source, sourceJobID string, targetCompanyID, companyID int64) error {
+	tag, err := s.pool.Exec(ctx, moveJobQuery, strings.TrimSpace(source), strings.TrimSpace(sourceJobID), targetCompanyID, companyID)
+	if err != nil {
+		return fmt.Errorf("job: moving %s/%s to target %d: %w", source, sourceJobID, targetCompanyID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("job: moving %s/%s: %w", source, sourceJobID, ErrNotFound)
+	}
+	return nil
+}
+
 // jobColumnsForAPI is the column list List/Get select, in the order
 // scanJobSummary expects. Only 'open' jobs are ever exposed through the
 // public Repository interface — a removed/closed job is not something
 // a job-seeker should be shown, even if it is still in the table for
 // ingestion's own history/audit purposes.
-const jobColumnsForAPI = `j.id, j.title, c.name, c.is_priority, t.market, j.remote_type, j.employment_type,
+const jobColumnsForAPI = `j.id, j.title, c.name, c.is_priority, t.market, j.source, j.remote_type, j.employment_type,
 	j.location_raw, COALESCE(j.published_at, j.first_seen_at) AS posted_at, j.application_url`
 
 // List returns open jobs matching filter, newest-first (ties broken by
@@ -482,7 +554,7 @@ func (s *Store) Get(ctx context.Context, id string) (Job, error) {
 		})
 	}
 	err = s.pool.QueryRow(ctx, query, args...).Scan(
-		&dbID, &j.Title, &j.CompanyName, &j.IsPriority, &j.Market, &remoteType, &employmentType,
+		&dbID, &j.Title, &j.CompanyName, &j.IsPriority, &j.Market, &j.Source, &remoteType, &employmentType,
 		&locationRaw, &j.PostedAt, &j.ApplicationURL, &description,
 	)
 	if err != nil {
@@ -517,7 +589,7 @@ func scanJobSummaryWithTotal(row pgx.Row) (Job, int, error) {
 		total          int
 	)
 	err := row.Scan(
-		&dbID, &j.Title, &j.CompanyName, &j.IsPriority, &j.Market, &remoteType, &employmentType,
+		&dbID, &j.Title, &j.CompanyName, &j.IsPriority, &j.Market, &j.Source, &remoteType, &employmentType,
 		&locationRaw, &j.PostedAt, &j.ApplicationURL, &total,
 	)
 	if err != nil {

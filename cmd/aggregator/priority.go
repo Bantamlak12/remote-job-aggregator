@@ -17,6 +17,7 @@ import (
 	"github.com/Bantamlak12/remote-job-aggregator/internal/ats/greenhouse"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/ats/jobsearch"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/ats/page"
+	"github.com/Bantamlak12/remote-job-aggregator/internal/ats/remoteboards"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/company"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/companymatch"
 	"github.com/Bantamlak12/remote-job-aggregator/internal/config"
@@ -35,14 +36,28 @@ const (
 
 // The many-employer collectors, in the order they run: Ethiojobs first, so
 // an opening both sites list is stored with Ethiojobs' full description
-// rather than LinkedIn's search snippet. Each name is also the ats_provider
-// of the targets it creates.
+// rather than LinkedIn's search snippet; then the remote job boards, the ones
+// with the fullest text first, so an opening several boards list is stored
+// from the richest. Each name is also the ats_provider of the targets it
+// creates.
 const (
 	collectorEthiojobs = "ethiojobs"
 	collectorLinkedIn  = "linkedin"
+
+	boardHimalayas     = "himalayas"
+	boardRemotive      = "remotive"
+	boardJobicy        = "jobicy"
+	boardWWR           = "weworkremotely"
+	boardWorkingNomads = "workingnomads"
+	boardRemoteOK      = "remoteok"
+
+	// remoteBoardsGroup names every remote job board in --providers.
+	remoteBoardsGroup = "remote-boards"
 )
 
-var collectorOrder = []string{collectorEthiojobs, collectorLinkedIn}
+var remoteBoards = []string{boardHimalayas, boardRemotive, boardJobicy, boardWWR, boardWorkingNomads, boardRemoteOK}
+
+var collectorOrder = append([]string{collectorEthiojobs, collectorLinkedIn}, remoteBoards...)
 
 // listingFetchPause is the delay between successive listing-page fetches of
 // a job board.
@@ -71,9 +86,13 @@ type ingestSources struct {
 	collectors       map[string]ingestion.Collector
 	defaultProviders []string
 	budget           *jobsearch.Budget
-	// resolver maps an employer name from a job site to a priority company;
-	// nil when the priority list could not be loaded.
-	resolver ingestion.EmployerResolver
+	// resolver maps an employer name from an Ethiopian source to a priority
+	// company; worldwideResolver does the same for worldwide sources but knows
+	// only the companies that hire outside Ethiopia (a worldwide board's
+	// "Parallel Solutions" is not necessarily the Ethiopian one). Both are nil
+	// when the priority list could not be loaded.
+	resolver          ingestion.EmployerResolver
+	worldwideResolver ingestion.EmployerResolver
 }
 
 // newIngestSources builds one client per source, all sharing one pooled
@@ -94,6 +113,12 @@ func newIngestSources(cfg *config.Config, httpClient *httpclient.Client, priorit
 		},
 		collectors: map[string]ingestion.Collector{
 			collectorEthiojobs: ethiojobs.New(pages, cfg.Ingestion.EthiojobsMaxPages, 0, listingFetchPause, logger),
+			boardHimalayas:     remoteboards.NewHimalayas(httpClient, cfg.Ingestion.HimalayasMaxPages, listingFetchPause, logger),
+			boardRemotive:      remoteboards.NewRemotive(httpClient, logger),
+			boardJobicy:        remoteboards.NewJobicy(httpClient, logger),
+			boardWWR:           remoteboards.NewWeWorkRemotely(httpClient, logger),
+			boardWorkingNomads: remoteboards.NewWorkingNomads(httpClient, logger),
+			boardRemoteOK:      remoteboards.NewRemoteOK(httpClient, logger),
 		},
 	}
 
@@ -101,11 +126,16 @@ func newIngestSources(cfg *config.Config, httpClient *httpclient.Client, priorit
 	if listErr != nil {
 		logger.Warn("priority company list unavailable: priority companies are not recognized in collected jobs and the per-company search source is disabled", "error", listErr)
 	} else {
-		entries := make([]companymatch.Entry, len(list.Companies))
-		for i, e := range list.Companies {
-			entries[i] = companymatch.Entry{Name: e.Name, Aliases: e.Aliases}
+		var all, outside []companymatch.Entry
+		for _, e := range list.Companies {
+			entry := companymatch.Entry{Name: e.Name, Aliases: e.Aliases}
+			all = append(all, entry)
+			if e.HiresOutsideEthiopia {
+				outside = append(outside, entry)
+			}
 		}
-		s.resolver = companymatch.NewMatcher(entries)
+		s.resolver = companymatch.NewMatcher(all)
+		s.worldwideResolver = companymatch.NewMatcher(outside)
 	}
 
 	if !cfg.Search.Configured() {
@@ -148,9 +178,38 @@ func newIngestSources(cfg *config.Config, httpClient *httpclient.Client, priorit
 			s.defaultProviders = append(s.defaultProviders, p)
 		}
 	}
+	// Ethiojobs and the remote job boards are free and run by default. The
+	// boards ask for few requests (Remotive: at most 4 a day; Himalayas
+	// refreshes daily), so ingest is meant to run about daily.
 	s.defaultProviders = append(s.defaultProviders, collectorEthiojobs)
+	s.defaultProviders = append(s.defaultProviders, remoteBoards...)
 	slices.Sort(s.defaultProviders)
 	return s
+}
+
+// expandGroups replaces the group name "remote-boards" with the individual
+// boards (in place, without duplicates), so --providers=remote-boards runs
+// all of them.
+func expandGroups(requested []string) []string {
+	if !slices.Contains(requested, remoteBoardsGroup) {
+		return requested
+	}
+	var out []string
+	add := func(p string) {
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	for _, p := range requested {
+		if p == remoteBoardsGroup {
+			for _, b := range remoteBoards {
+				add(b)
+			}
+			continue
+		}
+		add(p)
+	}
+	return out
 }
 
 // hasProvider reports whether name is an ATS provider or a collector.
@@ -177,29 +236,30 @@ func splitProviders(chosen []string, s ingestSources) (atsProviders, collectorNa
 	return atsProviders, collectorNames
 }
 
-// parseIngestArgs reads ingest's only option, --providers=a,b,c. nil
-// means "every available provider".
-func parseIngestArgs(args []string) ([]string, error) {
-	switch len(args) {
-	case 0:
-		return nil, nil
-	case 1:
-		list, ok := strings.CutPrefix(args[0], "--providers=")
-		if !ok {
-			break
+// parseIngestArgs reads ingest's options: --providers=a,b,c (nil means "every
+// available provider") and --force, which makes rate-limited job boards run
+// even if they ran recently.
+func parseIngestArgs(args []string) (providers []string, force bool, err error) {
+	usage := errors.New("ingest: usage: ingest [--providers=greenhouse,feed,careers-site,ethiojobs,remote-boards,search,linkedin] [--force]")
+	for _, a := range args {
+		if a == "--force" {
+			force = true
+			continue
 		}
-		var out []string
+		list, ok := strings.CutPrefix(a, "--providers=")
+		if !ok || providers != nil {
+			return nil, false, usage
+		}
 		for p := range strings.SplitSeq(list, ",") {
 			if p = strings.TrimSpace(p); p != "" {
-				out = append(out, p)
+				providers = append(providers, p)
 			}
 		}
-		if len(out) == 0 {
-			return nil, errors.New("ingest: --providers needs at least one provider name")
+		if len(providers) == 0 {
+			return nil, false, errors.New("ingest: --providers needs at least one provider name")
 		}
-		return out, nil
 	}
-	return nil, errors.New("ingest: usage: ingest [--providers=greenhouse,feed,careers-site,ethiojobs,search,linkedin]")
+	return providers, force, nil
 }
 
 // chooseProviders resolves the requested providers against the ones that
@@ -210,6 +270,7 @@ func chooseProviders(requested []string, s ingestSources) ([]string, error) {
 	if requested == nil {
 		return s.defaultProviders, nil
 	}
+	requested = expandGroups(requested)
 	var unavailable []string
 	for _, p := range requested {
 		if !s.hasProvider(p) {

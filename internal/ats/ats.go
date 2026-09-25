@@ -26,6 +26,13 @@ import (
 // package and recoupling itself to one ATS.
 var ErrBoardNotFound = errors.New("ats: board not found")
 
+// ErrPartialResult marks an error that came with usable jobs: a collector
+// that read part of its source and then failed (a later page hit a rate
+// limit) returns the jobs it has together with an error wrapping this. The
+// ingester stores those jobs and still reports the failure, so a truncated
+// run is never mistaken for a complete one.
+var ErrPartialResult = errors.New("ats: partial result")
+
 // ErrInvalidBoardToken is returned when a board token is not safe to
 // place in a request URL. Not a "board is gone" signal: the token itself
 // is malformed, so it never reaches the network.
@@ -77,6 +84,13 @@ type Job struct {
 	// ExpiresAt is the application deadline when the source publishes one
 	// (zero: none known). The public API stops serving the job after it.
 	ExpiresAt time.Time
+	// RemoteType and EmploymentType are what the source itself says about the
+	// role, in the jobs table's vocabulary ("remote", "hybrid", "onsite";
+	// "full_time", "part_time", "contract", "internship"). "" means the
+	// source does not say, and a stored value is then left as it is. Remote
+	// job boards fill RemoteType; ATS boards mostly cannot.
+	RemoteType     string
+	EmploymentType string
 	// Employer names the company that posted the job. Only multi-employer
 	// sources (job boards, search) fill it; a per-company board (Greenhouse,
 	// a feed, a careers page) leaves it empty because the target already
